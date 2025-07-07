@@ -262,7 +262,7 @@ if __name__ == "__main__":
     
     if not TOKEN:
         print("❌ DISCORD_TOKEN이 설정되지 않았습니다!")
-        print("1. .env 파일을 생성하고 ***REMOVED***
+        print("1. .env 파일을 생성하고 DISCORD_TOKEN=your_bot_token을 추가하세요")
         print("2. 또는 직접 TOKEN 변수에 봇 토큰을 입력하세요")
         exit(1)
     

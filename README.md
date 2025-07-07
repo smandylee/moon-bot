@@ -35,7 +35,7 @@ pip install -r requirements.txt
 1. `env_example.txt` 파일을 참고하여 `.env` 파일 생성
 2. `.env` 파일에 봇 토큰 추가:
 ```
-***REMOVED***
+DISCORD_TOKEN=your_actual_bot_token_here
 ```
 
 ### 5. 봇 실행

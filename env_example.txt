@@ -1,3 +1,6 @@
 # 디스코드 봇 토큰을 여기에 입력하세요
 # Discord Developer Portal에서 봇을 생성한 후 얻은 토큰을 복사해서 붙여넣으세요
-***REMOVED***
+DISCORD_TOKEN=your_discord_bot_token_here
+
+# OpenAI API 키를 여기에 입력하세요
+OPENAI_API_KEY=your_openai_api_key_here
