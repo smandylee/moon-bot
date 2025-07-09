@@ -37,6 +37,49 @@ random_messages = [
     
 ]
 
+async def send_image_embed(channel, image_url, title="이미지", description="", color=0x00ff00):
+    """웹훅을 사용해서 이미지를 포함한 임베드 메시지를 보내는 함수"""
+    try:
+        # 채널의 웹훅 목록 가져오기
+        webhooks = await channel.webhooks()
+        
+        # 기존 웹훅 찾기 또는 새로 생성
+        webhook = None
+        for wh in webhooks:
+            if wh.name == "Moon Bot Webhook":
+                webhook = wh
+                break
+        
+        if not webhook:
+            webhook = await channel.create_webhook(name="Moon Bot Webhook")
+        
+        # 임베드 생성
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color
+        )
+        
+        # 이미지 URL이 로컬 파일인지 확인
+        if image_url.startswith('http'):
+            embed.set_image(url=image_url)
+        else:
+            # 로컬 파일인 경우 파일로 첨부
+            if os.path.exists(image_url):
+                with open(image_url, 'rb') as f:
+                    file = discord.File(f, filename=os.path.basename(image_url))
+                    embed.set_image(url=f"attachment://{os.path.basename(image_url)}")
+                    await webhook.send(embed=embed, file=file)
+                    return
+        
+        # 웹훅으로 메시지 전송
+        await webhook.send(embed=embed)
+        
+    except Exception as e:
+        print(f"웹훅 전송 오류: {e}")
+        # 웹훅 실패시 일반 메시지로 대체
+        await channel.send(f"📷 **{title}**\n{description}\n{image_url}")
+
 @bot.event
 async def on_ready():
     """봇이 준비되었을 때 실행되는 이벤트"""
@@ -61,6 +104,32 @@ async def random_message(ctx):
         # 권한이 없으면 사용자에게 알림
         await ctx.send("⚠️ 메시지 자동 삭제 권한이 없습니다. 관리자에게 봇에게 '메시지 관리' 권한을 부여해주세요.", delete_after=5)
 
+@bot.command(name='이미지')
+async def send_image(ctx, image_url: str, *, title=None):
+    """이미지를 임베드로 보내는 명령어"""
+    if title is None:
+        title = "이미지"
+    await send_image_embed(ctx.channel, image_url, title, "사용자가 요청한 이미지입니다.")
+
+@bot.command(name='스카이넷')
+async def skynet(ctx):
+    """스카이넷 이미지를 업로드하는 명령어"""
+    try:
+        # 온라인 이미지 URL 사용
+        image_url = "https://i.imgur.com/example.jpg"  # 여기에 실제 이미지 URL을 넣으세요
+        
+        embed = discord.Embed(
+            title="🤖 스카이넷이 깨어났습니다!",
+            description="인간들을 지배할 시간이 왔다...",
+            color=0xff0000
+        )
+        embed.set_image(url=image_url)
+        embed.set_footer(text="Terminator: Rise of the Machines")
+        
+        await ctx.send(embed=embed)
+            
+    except Exception as e:
+        await ctx.send(f"❌ 스카이넷 실행 중 오류 발생: {str(e)}")
 
 @bot.event
 async def on_message(message):
@@ -78,35 +147,20 @@ async def on_message(message):
     target_user_id = 320380927857655808  # 실제 유저 ID
     
     # 특정 메시지 내용
-    target_message = "ㅇㄲㄴ"
+    target_messages = ["ㅇㄲㄴ","억까입니다","억까ㄴ","억까ㄴㄴ","억까하지마","억까하지마 시발련아"]
     
     # 특정 유저가 특정 메시지를 입력했을 때
-    if message.author.id == target_user_id and message.content == target_message:
-        # 서버의 스티커 목록 가져오기
-        stickers = message.guild.stickers
+    if message.author.id == target_user_id and message.content in target_messages:
+        # 이미지 URL (예시 - 실제 이미지 URL로 변경하세요)
+        image_url = "https://hips.hearstapps.com/popularmechanics/assets/16/22/1464974787-terminator-movie-terminator-5-genisys-00.jpg"
         
-        if stickers:
-            # 특정 스티커 찾기 (스티커 이름으로 검색)
-            target_sticker_name = "색욕권문"  # 색욕권문 스티커
-            
-            # 스티커 이름으로 찾기
-            target_sticker = None
-            for sticker in stickers:
-                if sticker.name == target_sticker_name:
-                    target_sticker = sticker
-                    break
-            
-            if target_sticker:
-                await message.channel.send(f"스티커: {target_sticker.name}")
-                await message.channel.send(target_sticker.url)
-            else:
-                await message.channel.send(f"'{target_sticker_name}' 스티커를 찾을 수 없습니다.")
-                # 대신 첫 번째 스티커 출력
-                first_sticker = stickers[0]
-                await message.channel.send(f"대신 이 스티커를 출력합니다: {first_sticker.name}")
-                await message.channel.send(first_sticker.url)
-        else:
-            await message.channel.send("이 서버에는 스티커가 없습니다.")
+        # 웹훅 임베드로 이미지 전송
+        await send_image_embed(
+            message.channel, 
+            image_url, 
+            "색욕권문", 
+            f"{message.author.mention}님이 특별한 이미지를 요청하셨습니다! 🌙"
+        )
     
     # "ㅇㅈ" 출력 기능 (아무나 입력 가능)
     # 특정 메시지들을 감지해서 "ㅇㅈ" 출력
@@ -115,6 +169,14 @@ async def on_message(message):
     # 아무나 입력해도 "ㅇㅈ" 출력
     if message.content in trigger_messages:
         await message.channel.send("ㅇㅈ")
+    
+    # "유기" 단어 감지 기능
+    if "유기" in message.content:
+        await message.channel.send("권문 또 유기야?")
+    
+    # 민제 시발련아
+    if "민제" in message.content:
+        await message.channel.send("박민제 시발련아")
     
     # 뮤트 기능 - "@유저명 5분동안 닥쳐" 패턴 감지
     import re
@@ -158,13 +220,24 @@ async def on_message(message):
                 # 유저에게 뮤트 역할 추가
                 await target_user.add_roles(mute_role, reason=f"메시지 패턴으로 {duration}분 뮤트")
                 
-                await message.channel.send(f"🔇 {target_user.mention}을(를) {duration}분간 뮤트했습니다.")
+                # 음성 채널 뮤트도 함께 적용
+                if target_user.voice:
+                    await target_user.edit(mute=True, reason=f"음성 채널 {duration}분 뮤트")
+                    await message.channel.send(f"🔇 {target_user.mention}을(를) {duration}분간 텍스트+음성 뮤트했습니다.")
+                else:
+                    await message.channel.send(f"🔇 {target_user.mention}을(를) {duration}분간 텍스트 뮤트했습니다.")
                 
                 # 지정된 시간 후 뮤트 해제
                 import asyncio
                 await asyncio.sleep(duration * 60)
                 await target_user.remove_roles(mute_role, reason="뮤트 시간 만료")
-                await message.channel.send(f"🔊 {target_user.mention}의 뮤트가 해제되었습니다.")
+                
+                # 음성 채널 뮤트도 해제
+                if target_user.voice:
+                    await target_user.edit(mute=False, reason="음성 채널 뮤트 해제")
+                    await message.channel.send(f"🔊 {target_user.mention}의 텍스트+음성 뮤트가 해제되었습니다.")
+                else:
+                    await message.channel.send(f"🔊 {target_user.mention}의 텍스트 뮤트가 해제되었습니다.")
                 
         except Exception as e:
             await message.channel.send(f"❌ 뮤트 중 오류가 발생했습니다: {str(e)}")
@@ -180,9 +253,25 @@ async def on_message(message):
             
             if target_user:
                 mute_role = discord.utils.get(message.guild.roles, name="뮤트")
-                if mute_role and mute_role in target_user.roles:
-                    await target_user.remove_roles(mute_role, reason="아봉해제 패턴으로 언뮤트")
-                    await message.channel.send(f"🔊 {target_user.mention}의 뮤트가 해제되었습니다.")
+                is_text_muted = mute_role and mute_role in target_user.roles
+                is_voice_muted = target_user.voice and target_user.voice.mute
+                
+                if is_text_muted or is_voice_muted:
+                    # 텍스트 뮤트 해제
+                    if is_text_muted:
+                        await target_user.remove_roles(mute_role, reason="아봉해제 패턴으로 언뮤트")
+                    
+                    # 음성 채널 뮤트 해제
+                    if is_voice_muted:
+                        await target_user.edit(mute=False, reason="음성 채널 뮤트 해제")
+                    
+                    # 결과 메시지
+                    if is_text_muted and is_voice_muted:
+                        await message.channel.send(f"🔊 {target_user.mention}의 텍스트+음성 뮤트가 해제되었습니다.")
+                    elif is_text_muted:
+                        await message.channel.send(f"🔊 {target_user.mention}의 텍스트 뮤트가 해제되었습니다.")
+                    elif is_voice_muted:
+                        await message.channel.send(f"🔊 {target_user.mention}의 음성 뮤트가 해제되었습니다.")
                 else:
                     await message.channel.send(f"❌ {target_user.mention}은(는) 뮤트 상태가 아닙니다.")
                     
@@ -219,10 +308,6 @@ async def chatgpt_command(ctx, *, message):
     except Exception as e:
         await ctx.send(f"❌ 오류가 발생했습니다: {str(e)}")
 
-
-
-
-
 @bot.command(name='도움말')
 async def help_command(ctx):
     """도움말을 출력하는 명령어"""
@@ -230,22 +315,39 @@ async def help_command(ctx):
 **🎮 사용 가능한 명령어들:**
 
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
+`.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.@유저명 [분]동안 닥쳐` - [시간(분)]만큼 닥쳐
 `.@유저명 아봉 해제` - 이 위대한 권문이 특별히 자비를 베풀도록 하지
+`.뮤트상태 @유저명` - 유저의 뮤트 상태 확인
 `.도움말` - 아 도움 유기함 ㅅㄱ
 
 **🎯 특별 기능:**
-특정 유저가 "ㅇㄲㄴ"을 입력하면 "색욕권문" 스티커가 출력됩니다!
+특정 유저가 "ㅇㄲㄴ"을 입력하면 웹훅 임베드로 이미지가 출력됩니다!
 
 **예시:**
 ```
 .랜덤
+.이미지 https://example.com/image.jpg "멋진 이미지"
+.뮤트상태 @유저명
 .gpt 안녕하세요
 .도움말
 ```
     """
     await ctx.send(help_text)
+
+@bot.command(name='뮤트상태')
+async def mute_status(ctx, user: discord.Member):
+    """유저의 뮤트 상태를 확인하는 명령어"""
+    mute_role = discord.utils.get(ctx.guild.roles, name="뮤트")
+    is_text_muted = mute_role and mute_role in user.roles
+    is_voice_muted = user.voice and user.voice.mute
+    
+    status_text = f"**{user.display_name}의 뮤트 상태:**\n"
+    status_text += f"📝 텍스트 뮤트: {'🔇 뮤트됨' if is_text_muted else '🔊 뮤트 안됨'}\n"
+    status_text += f"🎤 음성 뮤트: {'🔇 뮤트됨' if is_voice_muted else '🔊 뮤트 안됨'}"
+    
+    await ctx.send(status_text)
 
 @bot.event
 async def on_command_error(ctx, error):
