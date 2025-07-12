@@ -23,8 +23,8 @@ class ReloadHandler(FileSystemEventHandler):
             self.start_bot()
 
 if __name__ == "__main__":
-    path = "moon-bot"
-    event_handler = ReloadHandler("moon-bot/bot.py")
+    path = "."  # 현재 디렉토리
+    event_handler = ReloadHandler("bot.py")
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
