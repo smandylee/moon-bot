@@ -1,81 +1,145 @@
-# 🌙 Moon Bot - 디스코드 봇
+# 🌙 Moon Bot - Discord Bot
 
-**다양한 기능을 갖춘 디스코드 봇입니다!**
+**A feature-rich Discord bot with various entertainment and utility functions!**
 
-## 🚀 주요 기능
+## 🚀 Key Features
 
-### 🎮 기본 기능
-- `.랜덤` - 랜덤한 한국어 메시지 출력
-- `.롤`, `.헬다`, `.배` - 게임 맨션 명령어
-- `.이미지 [URL]` - 이미지 임베드 전송
-- `.gpt [메시지]` - ChatGPT API 연동
-- `.@유저명 [분]동안 닥쳐` - 뮤트 기능
-- `.뮤트상태 @유저명` - 뮤트 상태 확인
+### 🎮 Basic Commands
+- `.랜덤` - Output random Korean messages
+- `.롤`, `.헬다`, `.배` - Game mention commands
+- `.이미지 [URL]` - Send image embeds
+- `.gpt [message]` - ChatGPT API integration
+- `.@유저명 [분]동안 닥쳐` - Mute functionality
+- `.뮤트상태 @유저명` - Check mute status
 
-### 🔮 운세 기능
-- `.가챠운세` - 가챠 전에 확인하는 특별한 운세
+### 🔮 Fortune & Entertainment
+- `.가챠운세` - Special fortune before gacha pulls
+- `.워쉽가챠 [count]` - Warships gacha simulation
+- `.림버스 [count]` - Limbus Company gacha simulation
+- `.점메추` - Lunch recommendations
 
+### 🎯 Advanced Features
+- `.인성진단 @유저명` - Personality analysis of users
+- `.부검 [query]` - Search through message history
+- `.포켓몬위치 [name]` - Find Pokemon locations
+- `.대화모드` - AI conversation mode
+- `.멤버목록` - Display server member list
 
+## 📋 Installation & Setup
 
-## 📋 설치 및 설정
-
-### 1. 필요한 패키지 설치
+### 1. Install Required Packages
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 디스코드 봇 생성
-1. [Discord Developer Portal](https://discord.com/developers/applications)에 접속
-2. "New Application" 클릭하여 새 애플리케이션 생성
-3. 왼쪽 메뉴에서 "Bot" 클릭
-4. "Add Bot" 클릭하여 봇 생성
-5. "Reset Token"을 클릭하여 봇 토큰 복사
+### 2. Create Discord Bot
+1. Visit [Discord Developer Portal](https://discord.com/developers/applications)
+2. Click "New Application" to create a new application
+3. Go to "Bot" in the left menu
+4. Click "Add Bot" to create a bot
+5. Click "Reset Token" to copy the bot token
 
-### 3. 봇을 서버에 초대
-1. "OAuth2" → "URL Generator" 클릭
-2. "Scopes"에서 "bot" 체크
-3. "Bot Permissions"에서 다음 권한들 체크:
+### 3. Invite Bot to Server
+1. Go to "OAuth2" → "URL Generator"
+2. Check "bot" in "Scopes"
+3. Select the following permissions in "Bot Permissions":
    - Send Messages
    - Read Message History
    - Use Slash Commands
-4. 생성된 URL로 접속하여 봇을 서버에 초대
+   - Manage Messages
+   - Add Reactions
+4. Use the generated URL to invite the bot to your server
 
-### 4. 환경변수 설정
-1. `env_example.txt` 파일을 참고하여 `.env` 파일 생성
-2. `.env` 파일에 봇 토큰과 API 키 추가:
+### 4. Environment Variables Setup
+1. Create a `.env` file based on `env_example.txt`
+2. Add your bot token and API keys to the `.env` file:
 ```
 DISCORD_TOKEN=your_actual_bot_token_here
-OPENAI_API_KEY=your_openai_api_key_here  # ChatGPT 기능 사용시
+OPENAI_API_KEY=your_openai_api_key_here  # For ChatGPT functionality
+GEMINI_API_KEY=your_gemini_api_key_here  # For Gemini AI functionality
 ```
 
-### 5. 봇 실행
+### 5. Run the Bot
 ```bash
 python bot.py
 ```
 
-## 🎮 사용법
+## 🎮 Usage
 
-### 기본 명령어
-디스코드 채널에서 다음 명령어들을 사용할 수 있습니다:
+### Basic Commands
+Use these commands in your Discord channel:
 
-- `.랜덤` - 랜덤한 한국어 메시지 출력
-- `.롤`, `.헬다`, `.배` - 게임 맨션
-- `.이미지 [URL] [제목]` - 이미지 임베드 전송
-- `.gpt [메시지]` - ChatGPT와 대화
-- `.@유저명 [분]동안 닥쳐` - 유저 뮤트
-- `.@유저명 아봉해제` - 뮤트 해제
-- `.뮤트상태 @유저명` - 뮤트 상태 확인
-- `.가챠운세` - 가챠 전 특별 운세
-- `.도움말` - 도움말 보기
+- `.랜덤` - Output random Korean messages
+- `.롤`, `.헬다`, `.배` - Game mentions
+- `.이미지 [URL] [title]` - Send image embeds
+- `.gpt [message]` - Chat with ChatGPT
+- `.@유저명 [분]동안 닥쳐` - Mute a user
+- `.@유저명 아봉해제` - Unmute a user
+- `.뮤트상태 @유저명` - Check mute status
+- `.가챠운세` - Special fortune before gacha
+- `.도움말` - Show help menu
 
+### Entertainment Commands
+- `.워쉽가챠 [count]` - Simulate Warships gacha pulls
+- `.림버스 [count]` - Simulate Limbus Company gacha pulls
+- `.점메추` - Get lunch recommendations
+- `.인성진단 @유저명` - Analyze user's personality
+- `.부검 [query]` - Search message history
+- `.포켓몬위치 [name]` - Find Pokemon locations
 
+### Advanced Features
+- `.대화모드 [on/off]` - Toggle AI conversation mode
+- `.멤버목록` - Display server member list
 
-## 🔧 커스터마이징
+## 🔧 Customization
 
-### 기본 기능 커스터마이징
-- `bot.py` 파일의 `random_messages` 리스트를 수정하여 원하는 메시지들을 추가하거나 변경할 수 있습니다.
-- `target_user_ids` 리스트를 수정하여 맨션할 유저들을 변경할 수 있습니다.
+### Basic Feature Customization
+- Modify the `random_messages` list in `bot.py` to add or change random messages
+- Update the `target_user_ids` list to change mentioned users
+- Customize game mention messages in the respective command functions
 
-## 📝 라이선스
+### API Integration
+- The bot supports both OpenAI GPT and Google Gemini AI
+- Configure API keys in the `.env` file for full functionality
 
-이 프로젝트는 MIT 라이선스 하에 배포됩니다. 
+## 📁 Project Structure
+
+```
+moon_bot/
+├── bot.py                 # Main bot file
+├── pokemon_data.py        # Pokemon data and functions
+├── requirements.txt       # Python dependencies
+├── env_example.txt       # Environment variables template
+├── README.md             # This file
+└── render.yaml           # Deployment configuration
+```
+
+## 🛠️ Dependencies
+
+- `discord.py==2.3.2` - Discord API wrapper
+- `python-dotenv==1.0.0` - Environment variable management
+- `openai==1.3.7` - OpenAI API integration
+- `google-generativeai` - Google Gemini AI integration
+
+## 🚀 Deployment
+
+The bot can be deployed on various platforms:
+- **Local**: Run `python bot.py`
+- **Cloud**: Use the provided `render.yaml` for Render deployment
+- **VPS**: Upload files and run with `python bot.py`
+
+## 📝 License
+
+This project is distributed under the MIT License.
+
+## 🤝 Contributing
+
+Feel free to contribute to this project by:
+1. Forking the repository
+2. Creating a feature branch
+3. Making your changes
+4. Submitting a pull request
+
+## 📞 Support
+
+If you encounter any issues or have questions, please check the code comments or create an issue in the repository. 
