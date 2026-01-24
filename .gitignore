@@ -1,5 +1,6 @@
 # 환경 변수 파일
 .env
+.git-askpass.sh
 
 # Python
 __pycache__/

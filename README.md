@@ -18,6 +18,9 @@
 - `.림버스 [count]` - Limbus Company gacha simulation
 - `.점메추` - Lunch recommendations
 
+### ⚓ World of Warships
+- `.워쉽전적 [플레이어명]` - Search player stats on WoWS US server
+
 ### 🎯 Advanced Features
 - `.인성진단 @유저명` - Personality analysis of users
 - `.부검 [query]` - Search through message history
@@ -57,6 +60,7 @@ pip install -r requirements.txt
 DISCORD_TOKEN=your_actual_bot_token_here
 OPENAI_API_KEY=your_openai_api_key_here  # For ChatGPT functionality
 GEMINI_API_KEY=your_gemini_api_key_here  # For Gemini AI functionality
+WARGAMING_API_KEY=your_wargaming_api_key_here  # For WoWS stats (Get it from https://developers.wargaming.net/)
 ```
 
 ### 5. Run the Bot
@@ -86,6 +90,10 @@ Use these commands in your Discord channel:
 - `.인성진단 @유저명` - Analyze user's personality
 - `.부검 [query]` - Search message history
 - `.포켓몬위치 [name]` - Find Pokemon locations
+
+### World of Warships Commands
+- `.워쉽전적 [player_name]` - Look up player statistics on WoWS US server
+  - Displays: Win rate, battles, damage, survival rate, etc.
 
 ### Advanced Features
 - `.대화모드 [on/off]` - Toggle AI conversation mode
@@ -120,6 +128,8 @@ moon_bot/
 - `python-dotenv==1.0.0` - Environment variable management
 - `openai==1.3.7` - OpenAI API integration
 - `google-generativeai` - Google Gemini AI integration
+- `requests==2.31.0` - HTTP requests
+- `aiohttp==3.9.1` - Async HTTP client
 
 ## 🚀 Deployment
 
