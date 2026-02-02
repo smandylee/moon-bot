@@ -271,6 +271,7 @@ def terminal_command_handler():
     print("사용 가능한 명령어:")
     print("  - 'terminal on': 터미널 입력 모드 활성화")
     print("  - 'terminal off': 터미널 입력 모드 비활성화")
+    print("  - 'dm': 특정 유저에게 DM 전송")
     print("  - 'quit': 봇 종료")
     print("  - 'help': 도움말 표시")
     
@@ -347,10 +348,65 @@ def terminal_command_handler():
                 asyncio.run_coroutine_threadsafe(bot.close(), bot.loop)
                 break
                 
+            elif command == 'dm':
+                # DM 전송 모드
+                if bot.guilds:
+                    guild = bot.guilds[0]
+                    members = [m for m in guild.members if not m.bot]
+                    
+                    if members:
+                        print(f"\n📋 DM 전송 가능한 유저 목록:")
+                        for i, member in enumerate(members, 1):
+                            print(f"  {i}. {member.name} ({member.display_name})")
+                        
+                        # 유저 선택
+                        try:
+                            choice = input(f"\n유저 번호를 선택하세요 (1-{len(members)}): ").strip()
+                            if choice.isdigit():
+                                user_index = int(choice) - 1
+                                if 0 <= user_index < len(members):
+                                    selected_user = members[user_index]
+                                    print(f"\n✅ {selected_user.display_name}에게 DM 전송 모드")
+                                    print("💬 메시지를 입력하세요 (종료하려면 'exit' 입력):")
+                                    
+                                    # DM 전송 루프
+                                    while True:
+                                        try:
+                                            dm_message = input("DM> ").strip()
+                                            if dm_message.lower() == 'exit':
+                                                print("📤 DM 전송 모드 종료")
+                                                break
+                                            if dm_message:
+                                                # DM 전송
+                                                async def send_dm():
+                                                    try:
+                                                        await selected_user.send(dm_message)
+                                                        print(f"✅ DM 전송 완료: {dm_message[:50]}...")
+                                                    except discord.Forbidden:
+                                                        print("❌ DM 전송 실패: 유저가 DM을 차단했거나 설정을 꺼놨습니다.")
+                                                    except Exception as e:
+                                                        print(f"❌ DM 전송 오류: {e}")
+                                                
+                                                asyncio.run_coroutine_threadsafe(send_dm(), bot.loop)
+                                        except (EOFError, KeyboardInterrupt):
+                                            print("\n📤 DM 전송 모드 종료")
+                                            break
+                                else:
+                                    print(f"❌ 1-{len(members)} 사이의 번호를 입력해주세요.")
+                            else:
+                                print("❌ 숫자를 입력해주세요.")
+                        except (EOFError, KeyboardInterrupt):
+                            print("\n❌ 유저 선택이 취소되었습니다.")
+                    else:
+                        print("❌ DM 전송 가능한 유저가 없습니다!")
+                else:
+                    print("❌ 봇이 서버에 연결되지 않았습니다!")
+                
             elif command == 'help':
                 print("💻 사용 가능한 명령어:")
                 print("  - 'terminal on': 터미널 입력 모드 활성화 (채널 선택 가능)")
                 print("  - 'terminal off': 터미널 입력 모드 비활성화")
+                print("  - 'dm': 특정 유저에게 DM 전송")
                 print("  - 'quit': 봇 종료")
                 print("  - 'help': 도움말 표시")
                 
@@ -731,6 +787,14 @@ async def on_message(message):
         print("🤖 봇 자신의 메시지 무시")
         return
     
+    # DM 채널에서 온 메시지 감지 (답장)
+    if isinstance(message.channel, discord.DMChannel):
+        print(f"\n📩 ========== DM 수신 ==========")
+        print(f"👤 보낸 사람: {message.author.name} ({message.author.display_name})")
+        print(f"💬 내용: {message.content}")
+        print(f"⏰ 시간: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"================================\n")
+    
     # 명령어로 시작하는 메시지는 명령어 시스템이 처리하도록
     if message.content.startswith('.'):
         await bot.process_commands(message)
@@ -937,7 +1001,7 @@ async def on_message(message):
                 except Exception as stream_error:
                     print(f"대화모드 스트리밍 오류: {stream_error}")
                     await reply_msg.delete()
-                        
+            
             except Exception as e:
                 print(f"대화모드 응답 오류: {e}")
     
@@ -977,6 +1041,17 @@ async def on_message(message):
     # "유기" 단어 감지 기능
     if "유기" in message.content:
         await message.channel.send("권문 또 유기야?")
+    
+    # "상희" + "워쉽/배" 또는 "특정유저멘션" + "워쉽/배" 감지 시 스티커 출력
+    sanghee_mentioned = "상희" in message.content or "<@406707656158478338>" in message.content or "<@!406707656158478338>" in message.content
+    ship_keyword = "워쉽" in message.content or "배" in message.content
+    
+    if sanghee_mentioned and ship_keyword:
+        try:
+            sticker = await bot.fetch_sticker(1467026345165983905)
+            await message.channel.send(stickers=[sticker])
+        except Exception as e:
+            print(f"상희 스티커 전송 오류: {e}")
     
     # 이재용
     if "이재용" in message.content:
@@ -1486,10 +1561,122 @@ async def ai_chat(ctx, *, question: str = None):
             msg_count = len(conversation_buffer[user_id_str].get('messages', []))
             if msg_count >= SUMMARY_THRESHOLD:
                 await summarize_and_save_conversation(ctx.author.id, ctx.author.display_name)
-            
+        
     except Exception as e:
         await ctx.send(f"❌ 오류: {str(e)}")
         print(f"AI 채팅 오류: {e}")
+
+
+
+
+async def google_search(query: str, num_results: int = 5):
+    """Google Custom Search API를 사용하여 웹 검색"""
+    try:
+        api_key = os.getenv('GEMINI_API_KEY')  # Google API 키 (Custom Search도 동일)
+        search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
+        
+        if not api_key:
+            return None, "GEMINI_API_KEY가 설정되지 않았습니다."
+        if not search_engine_id:
+            return None, "GOOGLE_SEARCH_ENGINE_ID가 설정되지 않았습니다. .env 파일에 추가하세요."
+        
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'key': api_key,
+            'cx': search_engine_id,
+            'q': query,
+            'num': min(num_results, 10)
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    results = []
+                    
+                    if 'items' in data:
+                        for item in data['items']:
+                            results.append({
+                                'title': item.get('title', ''),
+                                'snippet': item.get('snippet', ''),
+                                'link': item.get('link', '')
+                            })
+                    
+                    return results, None
+                else:
+                    error_text = await response.text()
+                    print(f"Google Search API 오류: {response.status} - {error_text}")
+                    return None, f"검색 API 오류: {response.status}\n{error_text[:200]}"
+                    
+    except Exception as e:
+        return None, f"검색 중 오류: {str(e)}"
+
+
+@bot.command(name='서치챗')
+async def search_chat(ctx, *, query: str = None):
+    """웹 검색 결과를 바탕으로 AI가 답변하는 명령어"""
+    if not query:
+        await ctx.send("사용법: `.서치챗 [검색할 내용]`\n예시: `.서치챗 오늘 날씨는 어때?`")
+        return
+    
+    try:
+        # 검색 중 메시지
+        search_msg = await ctx.reply("🔍 검색 중...")
+        
+        # Google Custom Search 실행
+        search_results, error = await google_search(query, num_results=5)
+        
+        if error:
+            await search_msg.edit(content=f"❌ {error}")
+            return
+        
+        if not search_results:
+            await search_msg.edit(content="❌ 검색 결과를 찾을 수 없습니다.")
+            return
+        
+        # 검색 결과를 AI에게 전달할 컨텍스트 생성
+        search_context = "웹 검색 결과:\n\n"
+        for i, result in enumerate(search_results, 1):
+            search_context += f"[{i}] {result['title']}\n"
+            search_context += f"내용: {result['snippet']}\n"
+            search_context += f"링크: {result['link']}\n\n"
+        
+        # AI 프롬프트 생성
+        memory_context = get_memory_context(ctx.author.id)
+        speech_style = get_speech_style_instruction(ctx.author.id)
+        
+        prompt = f"""{speech_style}{memory_context}
+다음 웹 검색 결과를 바탕으로 질문에 답변해줘.
+
+질문: {query}
+
+{search_context}
+
+검색 결과를 참고해서 정확하고 유용한 답변을 해줘. 답변은 자연스럽고 친근하게.
+"""
+        
+        await search_msg.edit(content="🤖 AI가 답변 생성 중...")
+        
+        # AI 응답 생성
+        channel_id = ctx.channel.id
+        if channel_id not in chat_sessions:
+            chat_sessions[channel_id] = persona_model.start_chat(history=[])
+        
+        response = chat_sessions[channel_id].send_message(prompt)
+        ai_response = response.text.strip()
+        
+        if len(ai_response) > 1900:
+            ai_response = ai_response[:1900] + "..."
+        
+        await search_msg.edit(content=ai_response)
+        
+        # 대화 버퍼에 저장
+        add_to_conversation_buffer(ctx.author.id, ctx.author.display_name, 'user', f"[검색] {query}")
+        add_to_conversation_buffer(ctx.author.id, ctx.author.display_name, 'bot', ai_response)
+        
+    except Exception as e:
+        await ctx.send(f"❌ 오류: {str(e)}")
+        print(f"서치챗 오류: {e}")
 
 
 # 학습된 유저 스타일 저장 (유저ID -> 스타일 데이터)
@@ -1520,7 +1707,7 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
             try:
                 if not channel.permissions_for(ctx.guild.me).read_message_history:
                     continue
-                
+                    
                 async for message in channel.history(limit=500):
                     if message.author.id == target_user.id and message.content and not message.content.startswith('.'):
                         # 너무 짧거나 링크만 있는 메시지 제외
@@ -1529,7 +1716,7 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
                             message_count += 1
                             if message_count >= 150:
                                 break
-                
+                            
                 if message_count >= 150:
                     break
             except:
@@ -4199,13 +4386,34 @@ async def on_reaction_add(reaction, user):
 if __name__ == "__main__":
     # 토큰은 절대 코드에 하드코딩하지 말 것 (.env로 관리)
     TOKEN = os.getenv("DISCORD_TOKEN")
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN 환경 변수가 설정되지 않았습니다. (.env에 DISCORD_TOKEN=... 추가)")
     
+    # 토큰 검증
+    if not TOKEN:
+        print("❌ 오류: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다.")
+        print("📝 .env 파일에 DISCORD_TOKEN=your_actual_token_here 형식으로 추가해주세요.")
+        raise RuntimeError("DISCORD_TOKEN 환경 변수가 설정되지 않았습니다.")
+    
+    if TOKEN.strip() == "" or TOKEN == "your_discord_bot_token_here":
+        print("❌ 오류: DISCORD_TOKEN이 기본값이거나 빈 값입니다.")
+        print("📝 .env 파일에 실제 디스코드 봇 토큰을 입력해주세요.")
+        raise RuntimeError("DISCORD_TOKEN이 유효하지 않습니다.")
+    
+    # 토큰이 로드되었는지 확인 (보안상 일부만 표시)
+    token_preview = TOKEN[:10] + "..." if len(TOKEN) > 10 else "***"
+    print(f"✅ 토큰 로드 완료: {token_preview}")
     print("🚀 디스코드 봇을 시작합니다...")
     
     # 터미널 명령어 입력 스레드 시작
     terminal_command_thread = threading.Thread(target=terminal_command_handler, daemon=True)
     terminal_command_thread.start()
     
-    bot.run(TOKEN) 
+    try:
+        bot.run(TOKEN)
+    except discord.errors.LoginFailure as e:
+        print("❌ 디스코드 로그인 실패!")
+        print("🔍 가능한 원인:")
+        print("   1. .env 파일의 DISCORD_TOKEN이 잘못되었거나 만료되었습니다.")
+        print("   2. 봇 토큰이 Discord Developer Portal에서 재발급되었습니다.")
+        print("   3. 봇이 삭제되었거나 비활성화되었습니다.")
+        print(f"💡 상세 오류: {e}")
+        raise 

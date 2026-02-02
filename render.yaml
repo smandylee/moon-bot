@@ -1,11 +1,17 @@
 services:
   - type: worker
     name: moon-bot
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
         sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_SEARCH_ENGINE_ID
+        sync: false
+      - key: WARGAMING_API_KEY
         sync: false 
