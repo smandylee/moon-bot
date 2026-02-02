@@ -4403,9 +4403,15 @@ if __name__ == "__main__":
     print(f"✅ 토큰 로드 완료: {token_preview}")
     print("🚀 디스코드 봇을 시작합니다...")
     
-    # 터미널 명령어 입력 스레드 시작
-    terminal_command_thread = threading.Thread(target=terminal_command_handler, daemon=True)
-    terminal_command_thread.start()
+    # 서버 환경 감지 (Railway, Render 등)
+    is_server = os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RENDER') or os.getenv('DYNO')
+    
+    # 로컬 환경에서만 터미널 명령어 입력 스레드 시작
+    if not is_server:
+        terminal_command_thread = threading.Thread(target=terminal_command_handler, daemon=True)
+        terminal_command_thread.start()
+    else:
+        print("☁️ 서버 환경 감지됨 - 터미널 입력 기능 비활성화")
     
     try:
         bot.run(TOKEN)
