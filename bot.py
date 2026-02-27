@@ -15,6 +15,7 @@ import queue
 import time
 import shlex
 import aiohttp
+import traceback
 from urllib.parse import urlparse
 from types import SimpleNamespace
 
@@ -805,6 +806,7 @@ def _parse_civitai_command_args(raw: str):
     - --steps <int>
     - --cfg <float>
     - --no-default-lora
+    - --raw (자연어 프롬프트 자동 변환 비활성화)
     """
     try:
         tokens = shlex.split(raw)
@@ -818,6 +820,7 @@ def _parse_civitai_command_args(raw: str):
     steps = 24
     cfg_scale = 7.0
     use_default_lora = True
+    raw_mode = False
     prompt_tokens = []
 
     i = 0
@@ -882,6 +885,10 @@ def _parse_civitai_command_args(raw: str):
             use_default_lora = False
             i += 1
             continue
+        if t == "--raw":
+            raw_mode = True
+            i += 1
+            continue
 
         prompt_tokens.append(t)
         i += 1
@@ -899,7 +906,39 @@ def _parse_civitai_command_args(raw: str):
         "steps": steps,
         "cfg_scale": cfg_scale,
         "use_default_lora": use_default_lora,
+        "raw_mode": raw_mode,
     }, None
+
+
+async def _build_civitai_prompt(user_prompt: str) -> str:
+    """자연어 입력을 Civitai용 영문 프롬프트로 정리"""
+    if not user_prompt:
+        return user_prompt
+
+    # AI 사용 불가 시 원문 사용
+    if gemini_model is None:
+        return user_prompt
+
+    instruction = f"""
+다음 사용자 입력을 이미지 생성용 프롬프트로 변환해.
+
+규칙:
+- 영어로만 출력
+- 쉼표로 구분된 키워드 스타일
+- 불필요한 설명 금지, 프롬프트 본문만 출력
+- 과도하게 길지 않게 1줄로 출력
+
+사용자 입력:
+{user_prompt}
+"""
+
+    try:
+        response = await asyncio.to_thread(gemini_model.generate_content, instruction)
+        converted = (response.text or "").strip().replace("\n", ", ")
+        return converted if converted else user_prompt
+    except Exception as e:
+        print(f"프롬프트 변환 실패(원문 사용): {e}")
+        return user_prompt
 
 
 @bot.command(name='이미지생성')
@@ -940,9 +979,23 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
         await ctx.send(f"❌ {model_error}")
         return
 
-    loading_msg = await ctx.reply("🎨 Civitai에 이미지 생성 요청 중...")
+    final_prompt = parsed["prompt"]
+    loading_msg = await ctx.reply("🎨 프롬프트 정리 중...")
+    if not parsed["raw_mode"]:
+        final_prompt = await _build_civitai_prompt(parsed["prompt"])
+    await loading_msg.edit(content="🎨 Civitai에 이미지 생성 요청 중...")
 
     try:
+        debug_context = {
+            "model": model_urn,
+            "raw_mode": parsed["raw_mode"],
+            "use_default_lora": parsed["use_default_lora"],
+            "loras": [l["urn"] for l in parsed["loras"]],
+            "size": f"{parsed['width'] or 768}x{parsed['height'] or 1024}",
+            "steps": parsed["steps"],
+            "cfg": parsed["cfg_scale"],
+        }
+
         def _create_job():
             os.environ["CIVITAI_API_TOKEN"] = civitai_token
             import civitai
@@ -950,7 +1003,7 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             payload = {
                 "model": model_urn,
                 "params": {
-                    "prompt": parsed["prompt"],
+                    "prompt": final_prompt,
                     "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
                     "scheduler": "EulerA",
                     "steps": parsed["steps"],
@@ -993,7 +1046,7 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
                 ctx.channel,
                 image_urls[0],
                 title="🎨 Civitai 생성 이미지",
-                description=f"프롬프트: {parsed['prompt'][:180]}"
+                description=f"프롬프트: {final_prompt[:180]}"
             )
             return
 
@@ -1035,11 +1088,39 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             ctx.channel,
             final_urls[0],
             title="🎨 Civitai 생성 이미지",
-            description=f"프롬프트: {parsed['prompt'][:180]}"
+            description=f"프롬프트: {final_prompt[:180]}"
         )
     except Exception as e:
-        await loading_msg.edit(content=f"❌ 이미지 생성 오류: {str(e)[:250]}")
-        print(f"Civitai 이미지 생성 오류: {e}")
+        # Civitai/HTTP 오류 상세 추출
+        status_code = None
+        error_body = ""
+        if hasattr(e, "response") and getattr(e, "response", None) is not None:
+            try:
+                status_code = getattr(e.response, "status_code", None)
+                error_body = getattr(e.response, "text", "") or ""
+            except Exception:
+                pass
+
+        try:
+            # 일부 예외는 args에 JSON/문자열을 포함
+            if not error_body and getattr(e, "args", None):
+                error_body = " | ".join([str(a) for a in e.args if a is not None])
+        except Exception:
+            pass
+
+        user_error = f"❌ 이미지 생성 오류: {str(e)[:250]}"
+        if status_code:
+            user_error += f" (HTTP {status_code})"
+        await loading_msg.edit(content=user_error)
+
+        print("==== Civitai 이미지 생성 상세 오류 ====")
+        print(f"기본 오류: {e}")
+        print(f"HTTP 상태코드: {status_code}")
+        print(f"사용 컨텍스트: {json.dumps(debug_context, ensure_ascii=False)}")
+        if error_body:
+            print(f"에러 바디/상세: {error_body[:2000]}")
+        print(traceback.format_exc())
+        print("====================================")
 
 
 @bot.command(name='이미지프리셋')
@@ -4851,7 +4932,7 @@ async def help_command(ctx):
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
 `.점메추` - 오늘 점심 뭐 먹을지 추천해줌
 `.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
-`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (이름 프리셋/URN 선택 가능)
+`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (자연어 자동 프롬프트 변환)
 `.이미지프리셋` - 등록된 모델/LoRA 이름 프리셋 보기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.인성진단 [@유저명]` - 채팅 패턴으로 인성 분석 (개재밌음)
