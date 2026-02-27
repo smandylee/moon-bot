@@ -14,10 +14,13 @@ import threading
 import queue
 import time
 import aiohttp
+from types import SimpleNamespace
 
-# Vertex AI 설정
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part, Content, GenerationConfig
+# Gemini( Vertex AI 모드 ) 설정
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 # PR Expected Values 로드
 try:
@@ -40,9 +43,9 @@ except Exception as e:
 # OpenAI API 설정
 openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
 
-# Vertex AI 초기화
+# Vertex AI 초기화 (google-genai SDK, Vertex 모드)
 GCP_PROJECT_ID = "alphavertex-486307"
-GCP_LOCATION = "us-central1"  # 미국(중앙) 리전
+GCP_LOCATION = "global"  # Gemini 3 Flash Preview 권장
 VERTEX_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash
 
 # 서비스 계정 키 파일 경로 설정
@@ -78,17 +81,109 @@ else:
     else:
         print("⚠️ GCP 서비스 계정 키를 찾을 수 없습니다.")
 
-# Vertex AI 초기화
-if HAS_GCP_CREDENTIALS:
+class _CompatResponse:
+    def __init__(self, text: str):
+        self.text = text or ""
+
+
+class _CompatChunk:
+    def __init__(self, text: str):
+        self.text = text or ""
+
+
+class _CompatChatSession:
+    def __init__(self, model):
+        self._model = model
+        self.history = []
+
+    def send_message(self, message: str, stream: bool = False):
+        if not stream:
+            response = self._model.generate_content(message)
+            self.history.append({"role": "user", "text": message})
+            self.history.append({"role": "model", "text": response.text})
+            return response
+
+        def _stream_gen():
+            full_text = ""
+            try:
+                prompt = self._model._build_prompt_with_history(message, self.history)
+                response_stream = self._model._client.models.generate_content_stream(
+                    model=self._model.model_name,
+                    contents=prompt,
+                )
+                for chunk in response_stream:
+                    chunk_text = getattr(chunk, "text", "") or ""
+                    if chunk_text:
+                        full_text += chunk_text
+                        yield _CompatChunk(chunk_text)
+            finally:
+                self.history.append({"role": "user", "text": message})
+                self.history.append({"role": "model", "text": full_text})
+
+        return _stream_gen()
+
+
+class GenerativeModel:
+    def __init__(self, model_name: str, system_instruction=None, client=None):
+        self.model_name = model_name
+        self._client = client
+        if isinstance(system_instruction, list):
+            self.system_instruction = "\n".join([str(s) for s in system_instruction if s])
+        else:
+            self.system_instruction = str(system_instruction or "")
+
+    def _build_prompt_with_history(self, prompt: str, history=None) -> str:
+        chunks = []
+        if self.system_instruction:
+            chunks.append(f"[System]\n{self.system_instruction}")
+        if history:
+            hist = history[-20:]
+            lines = []
+            for item in hist:
+                role = item.get("role", "user")
+                text = item.get("text", "")
+                if text:
+                    lines.append(f"{role}: {text}")
+            if lines:
+                chunks.append("[History]\n" + "\n".join(lines))
+        chunks.append(f"[User]\n{prompt}")
+        return "\n\n".join(chunks)
+
+    def generate_content(self, prompt: str):
+        if not self._client:
+            raise RuntimeError("AI client is not initialized")
+        full_prompt = self._build_prompt_with_history(prompt)
+        response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=full_prompt,
+        )
+        return _CompatResponse(getattr(response, "text", ""))
+
+    def start_chat(self, history=None):
+        session = _CompatChatSession(self)
+        if history:
+            session.history = list(history)
+        return session
+
+
+genai_client = None
+if HAS_GCP_CREDENTIALS and genai is not None:
     try:
-        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-        gemini_model = GenerativeModel(VERTEX_MODEL)
-        print(f"✅ Vertex AI 초기화 완료 (프로젝트: {GCP_PROJECT_ID}, 리전: {GCP_LOCATION})")
+        genai_client = genai.Client(
+            vertexai=True,
+            project=GCP_PROJECT_ID,
+            location=GCP_LOCATION,
+        )
+        gemini_model = GenerativeModel(VERTEX_MODEL, client=genai_client)
+        print(f"✅ Vertex AI 초기화 완료 (google-genai, 프로젝트: {GCP_PROJECT_ID}, 리전: {GCP_LOCATION})")
     except Exception as e:
         print(f"❌ Vertex AI 초기화 실패: {e}")
         gemini_model = None
 else:
-    print("⚠️ Vertex AI 비활성화: GCP 인증 정보가 없습니다.")
+    if genai is None:
+        print("⚠️ google-genai 패키지를 찾지 못해 Vertex AI를 비활성화합니다.")
+    else:
+        print("⚠️ Vertex AI 비활성화: GCP 인증 정보가 없습니다.")
     gemini_model = None
 
 # 페르소나 AI 채팅 설정
@@ -116,7 +211,8 @@ persona_model = None
 if gemini_model is not None:
     persona_model = GenerativeModel(
         VERTEX_MODEL,
-        system_instruction=[DEFAULT_PERSONA]
+        system_instruction=[DEFAULT_PERSONA],
+        client=genai_client,
     )
 
 # 채널별 대화 세션 관리
@@ -169,7 +265,8 @@ def load_memory():
                 if gemini_model is not None:
                     persona_model = GenerativeModel(
                         VERTEX_MODEL,
-                        system_instruction=[current_persona]
+                        system_instruction=[current_persona],
+                        client=genai_client,
                     )
                     print(f"✅ 페르소나 복원: {data.get('name', 'Unknown')}")
                 else:
@@ -1498,7 +1595,8 @@ async def change_persona(ctx, *, new_persona: str = None):
         current_persona = new_persona
         persona_model = GenerativeModel(
             VERTEX_MODEL,
-            system_instruction=[new_persona]
+            system_instruction=[new_persona],
+            client=genai_client,
         )
         
         # 모든 대화 세션 리셋
@@ -1523,7 +1621,8 @@ async def reset_persona(ctx):
         current_persona = DEFAULT_PERSONA
         persona_model = GenerativeModel(
             VERTEX_MODEL,
-            system_instruction=[DEFAULT_PERSONA]
+            system_instruction=[DEFAULT_PERSONA],
+            client=genai_client,
         )
         chat_sessions.clear()
         
@@ -1941,7 +2040,8 @@ system instruction만 출력해 (다른 설명 없이):
         current_persona = generated_persona
         persona_model = GenerativeModel(
             VERTEX_MODEL,
-            system_instruction=[generated_persona]
+            system_instruction=[generated_persona],
+            client=genai_client,
         )
         chat_sessions.clear()
         active_learned_persona = user_id_str
@@ -2002,7 +2102,8 @@ async def apply_learned_persona(ctx, target_user: discord.Member = None):
         current_persona = data['persona_instruction']
         persona_model = GenerativeModel(
             VERTEX_MODEL,
-            system_instruction=[data['persona_instruction']]
+            system_instruction=[data['persona_instruction']],
+            client=genai_client,
         )
         chat_sessions.clear()
         active_learned_persona = user_id_str
