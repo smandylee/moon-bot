@@ -2,7 +2,7 @@ services:
   - type: worker
     name: moon-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python -m pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir "google-cloud-aiplatform>=1.71.1"
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN

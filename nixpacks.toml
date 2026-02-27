@@ -2,7 +2,11 @@
 nixPkgs = ["python312"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "python -m pip install --upgrade pip",
+  "pip install --no-cache-dir -r requirements.txt",
+  "pip install --no-cache-dir \"google-cloud-aiplatform>=1.71.1\""
+]
 
 [start]
 cmd = "python bot.py"
