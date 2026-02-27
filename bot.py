@@ -42,8 +42,8 @@ openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
 
 # Vertex AI 초기화
 GCP_PROJECT_ID = "alphavertex-486307"
-GCP_LOCATION = "asia-northeast3"  # 서울 리전
-VERTEX_MODEL = "gemini-2.0-flash"  # Gemini 2.0 Flash (3 Flash Preview 사용 가능시 변경)
+GCP_LOCATION = "us-central1"  # 미국(중앙) 리전
+VERTEX_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash
 
 # 서비스 계정 키 파일 경로 설정
 GCP_KEY_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'gcp-key.json')
