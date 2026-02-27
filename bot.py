@@ -7,12 +7,16 @@ import openai
 import datetime
 from typing import Optional
 import json
+import re
 import asyncio
-import google.generativeai as genai
 import threading
 import queue
 import time
 import aiohttp
+
+# Vertex AI 설정
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part, Content, GenerationConfig
 
 # PR Expected Values 로드
 try:
@@ -35,9 +39,36 @@ except Exception as e:
 # OpenAI API 설정
 openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
 
-# Gemini API 설정
-genai.configure(api_key=os.getenv('GEMINI_API_KEY', 'your_gemini_api_key_here'))
-gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
+# Vertex AI 초기화
+GCP_PROJECT_ID = "alphavertex-486307"
+GCP_LOCATION = "asia-northeast3"  # 서울 리전
+VERTEX_MODEL = "gemini-2.0-flash"  # Gemini 2.0 Flash (3 Flash Preview 사용 가능시 변경)
+
+# 서비스 계정 키 파일 경로 설정
+GCP_KEY_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'gcp-key.json')
+if os.path.exists(GCP_KEY_FILE):
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = GCP_KEY_FILE
+    print(f"✅ GCP 서비스 계정 키 로드: {GCP_KEY_FILE}")
+else:
+    # Railway 등 서버 환경에서는 환경변수로 처리
+    gcp_key_json = os.getenv('GCP_KEY_JSON')
+    if gcp_key_json:
+        # 환경변수에서 JSON 키를 파일로 저장
+        with open('/tmp/gcp-key.json', 'w') as f:
+            f.write(gcp_key_json)
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/tmp/gcp-key.json'
+        print("✅ GCP 서비스 계정 키 로드 (환경변수)")
+    else:
+        print("⚠️ GCP 서비스 계정 키를 찾을 수 없습니다.")
+
+# Vertex AI 초기화
+try:
+    vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
+    gemini_model = GenerativeModel(VERTEX_MODEL)
+    print(f"✅ Vertex AI 초기화 완료 (프로젝트: {GCP_PROJECT_ID}, 리전: {GCP_LOCATION})")
+except Exception as e:
+    print(f"❌ Vertex AI 초기화 실패: {e}")
+    gemini_model = None
 
 # 페르소나 AI 채팅 설정
 DEFAULT_PERSONA = """
@@ -59,10 +90,10 @@ DEFAULT_PERSONA = """
 - 긴 설명이나 장문 금지
 """
 
-# 페르소나 모델 생성
-persona_model = genai.GenerativeModel(
-    model_name='gemini-3-pro-preview',
-    system_instruction=DEFAULT_PERSONA
+# 페르소나 모델 생성 (Vertex AI)
+persona_model = GenerativeModel(
+    VERTEX_MODEL,
+    system_instruction=[DEFAULT_PERSONA]
 )
 
 # 채널별 대화 세션 관리
@@ -112,9 +143,9 @@ def load_memory():
                 active_learned_persona = bot_memory['active_persona']
                 data = learned_user_styles[str(active_learned_persona)]
                 current_persona = data.get('persona_instruction', DEFAULT_PERSONA)
-                persona_model = genai.GenerativeModel(
-                    model_name='gemini-3-pro-preview',
-                    system_instruction=current_persona
+                persona_model = GenerativeModel(
+                    VERTEX_MODEL,
+                    system_instruction=[current_persona]
                 )
                 print(f"✅ 페르소나 복원: {data.get('name', 'Unknown')}")
             
@@ -228,13 +259,8 @@ load_memory()
 
 # ==================== 장기기억 시스템 끝 ====================
 
-# 존댓말 대상 유저 설정
-RESPECTFUL_USER_IDS = [264736737949908993]  # 이 유저들에게는 존댓말 사용
-
 def get_speech_style_instruction(user_id: int) -> str:
-    """유저에 따른 말투 지시 반환"""
-    if user_id in RESPECTFUL_USER_IDS:
-        return "\n[중요] 이 유저에게는 반드시 존댓말(~요, ~습니다)로 공손하게 대답해. 반말 금지!\n"
+    """유저별 존댓말 예외 규칙 비활성화"""
     return ""
 
 # Wargaming API 설정
@@ -1437,9 +1463,9 @@ async def change_persona(ctx, *, new_persona: str = None):
     try:
         # 새 페르소나로 모델 재생성
         current_persona = new_persona
-        persona_model = genai.GenerativeModel(
-            model_name='gemini-3-pro-preview',
-            system_instruction=new_persona
+        persona_model = GenerativeModel(
+            VERTEX_MODEL,
+            system_instruction=[new_persona]
         )
         
         # 모든 대화 세션 리셋
@@ -1459,9 +1485,9 @@ async def reset_persona(ctx):
     
     try:
         current_persona = DEFAULT_PERSONA
-        persona_model = genai.GenerativeModel(
-            model_name='gemini-3-pro-preview',
-            system_instruction=DEFAULT_PERSONA
+        persona_model = GenerativeModel(
+            VERTEX_MODEL,
+            system_instruction=[DEFAULT_PERSONA]
         )
         chat_sessions.clear()
         
@@ -1612,19 +1638,81 @@ async def google_search(query: str, num_results: int = 5):
         return None, f"검색 중 오류: {str(e)}"
 
 
+def extract_tool_call_from_text(text: str):
+    """LLM 응답에서 {"tool": "..."} 형태의 JSON을 추출"""
+    if not text:
+        return None
+
+    # 1) ```json ... ``` 코드펜스
+    code_fence_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    if code_fence_match:
+        try:
+            return json.loads(code_fence_match.group(1))
+        except Exception:
+            pass
+
+    # 2) 전체가 JSON 객체인 경우
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        pass
+
+    # 3) 응답 안의 단일 JSON 객체 추출
+    json_like_match = re.search(r"\{[^{}]*\"tool\"[^{}]*\}", text)
+    if json_like_match:
+        try:
+            return json.loads(json_like_match.group(0))
+        except Exception:
+            return None
+
+    return None
+
+
 @bot.command(name='서치챗')
 async def search_chat(ctx, *, query: str = None):
-    """웹 검색 결과를 바탕으로 AI가 답변하는 명령어"""
+    """참고 프로젝트 방식: AI JSON 도구호출(web_search) -> 검색 실행 -> 최종 답변"""
     if not query:
         await ctx.send("사용법: `.서치챗 [검색할 내용]`\n예시: `.서치챗 오늘 날씨는 어때?`")
         return
     
     try:
-        # 검색 중 메시지
-        search_msg = await ctx.reply("🔍 검색 중...")
-        
-        # Google Custom Search 실행
-        search_results, error = await google_search(query, num_results=5)
+        search_msg = await ctx.reply("🧠 검색 계획 생성 중...")
+
+        # 1) AI에게 web_search 도구호출 JSON 생성 요청 (virtual_assistant 방식 이식)
+        planner_prompt = f"""
+너는 도구 라우터야.
+사용자 요청을 웹 검색용 JSON으로 변환해.
+
+규칙:
+- 반드시 JSON 한 개만 출력
+- 형식: {{"tool":"web_search","input":"검색어"}}
+- tool 값은 반드시 web_search
+- input은 검색엔진에서 바로 쓸 짧고 정확한 검색어
+
+사용자 요청: {query}
+"""
+
+        tool_call = None
+        try:
+            planner_model = gemini_model or persona_model
+            planner_response = planner_model.generate_content(planner_prompt)
+            planner_text = (planner_response.text or "").strip()
+            tool_call = extract_tool_call_from_text(planner_text)
+        except Exception as planner_error:
+            print(f"서치챗 도구 라우팅 실패(폴백): {planner_error}")
+
+        # 파싱 실패 시 안전 폴백
+        if not tool_call or tool_call.get("tool") != "web_search":
+            tool_call = {"tool": "web_search", "input": query}
+
+        search_query = str(tool_call.get("input") or query).strip()
+        if not search_query:
+            search_query = query
+
+        await search_msg.edit(content=f"🔍 검색 중... (`{search_query}`)")
+
+        # 2) web_search 실행
+        search_results, error = await google_search(search_query, num_results=5)
         
         if error:
             await search_msg.edit(content=f"❌ {error}")
@@ -1634,25 +1722,39 @@ async def search_chat(ctx, *, query: str = None):
             await search_msg.edit(content="❌ 검색 결과를 찾을 수 없습니다.")
             return
         
-        # 검색 결과를 AI에게 전달할 컨텍스트 생성
+        # 3) 검색 결과 컨텍스트 생성
         search_context = "웹 검색 결과:\n\n"
         for i, result in enumerate(search_results, 1):
             search_context += f"[{i}] {result['title']}\n"
             search_context += f"내용: {result['snippet']}\n"
             search_context += f"링크: {result['link']}\n\n"
-        
-        # AI 프롬프트 생성
+
+        # 도구 실행 결과 구조체 (참고 프로젝트 방식의 toolResult 유사)
+        tool_result = {
+            "success": True,
+            "tool": "web_search",
+            "query": search_query,
+            "results": search_results
+        }
+
+        # 4) 최종 자연어 응답 생성
         memory_context = get_memory_context(ctx.author.id)
         speech_style = get_speech_style_instruction(ctx.author.id)
         
         prompt = f"""{speech_style}{memory_context}
-다음 웹 검색 결과를 바탕으로 질문에 답변해줘.
+다음은 도구 실행 결과야:
+{json.dumps(tool_result, ensure_ascii=False, indent=2)}
 
-질문: {query}
+사용자 원문 질문: {query}
+실제 검색어: {search_query}
 
 {search_context}
 
-검색 결과를 참고해서 정확하고 유용한 답변을 해줘. 답변은 자연스럽고 친근하게.
+지시:
+- 검색 결과를 바탕으로 핵심 답변 먼저 제시
+- 중요한 근거를 2~4개 포인트로 짧게 정리
+- 불확실하면 단정하지 말고 그렇게 명시
+- 마지막에 참고 링크를 최대 3개만 붙여
 """
         
         await search_msg.edit(content="🤖 AI가 답변 생성 중...")
@@ -1792,9 +1894,9 @@ system instruction만 출력해 (다른 설명 없이):
         
         # 바로 이 페르소나를 활성화
         current_persona = generated_persona
-        persona_model = genai.GenerativeModel(
-            model_name='gemini-3-pro-preview',
-            system_instruction=generated_persona
+        persona_model = GenerativeModel(
+            VERTEX_MODEL,
+            system_instruction=[generated_persona]
         )
         chat_sessions.clear()
         active_learned_persona = user_id_str
@@ -1850,9 +1952,9 @@ async def apply_learned_persona(ctx, target_user: discord.Member = None):
         data = learned_user_styles[user_id_str]
         
         current_persona = data['persona_instruction']
-        persona_model = genai.GenerativeModel(
-            model_name='gemini-3-pro-preview',
-            system_instruction=data['persona_instruction']
+        persona_model = GenerativeModel(
+            VERTEX_MODEL,
+            system_instruction=[data['persona_instruction']]
         )
         chat_sessions.clear()
         active_learned_persona = user_id_str
