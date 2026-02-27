@@ -1736,11 +1736,11 @@ async def ai_chat(ctx, *, question: str = None):
 async def google_search(query: str, num_results: int = 5):
     """Google Custom Search API를 사용하여 웹 검색"""
     try:
-        api_key = os.getenv('GEMINI_API_KEY')  # Google API 키 (Custom Search도 동일)
+        api_key = os.getenv('GOOGLE_SEARCH_API_KEY') or os.getenv('GEMINI_API_KEY')
         search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
         
         if not api_key:
-            return None, "GEMINI_API_KEY가 설정되지 않았습니다."
+            return None, "GOOGLE_SEARCH_API_KEY(또는 GEMINI_API_KEY)가 설정되지 않았습니다."
         if not search_engine_id:
             return None, "GOOGLE_SEARCH_ENGINE_ID가 설정되지 않았습니다. .env 파일에 추가하세요."
         
@@ -1774,6 +1774,46 @@ async def google_search(query: str, num_results: int = 5):
                     
     except Exception as e:
         return None, f"검색 중 오류: {str(e)}"
+
+
+async def search_with_vertex(query: str):
+    """Vertex(Google Search Grounding) 기반 검색. 실패 시 (None, error) 반환"""
+    if genai_client is None:
+        return None, "Vertex AI 클라이언트가 초기화되지 않았습니다."
+
+    prompt = f"""다음 질문에 대해 최신 정보를 검색해서 한국어로 답변해줘.
+
+질문: {query}
+
+형식:
+1) 핵심 답변
+2) 근거 요약 2~4개
+3) 참고 링크(가능하면)
+"""
+
+    def _run_vertex_search():
+        last_error = None
+        # google-genai 버전별 호환을 위해 두 가지 config 형태를 시도
+        config_candidates = [
+            {"tools": [{"google_search": {}}], "temperature": 0.3, "max_output_tokens": 1024},
+            {"temperature": 0.3, "max_output_tokens": 1024},
+        ]
+
+        for cfg in config_candidates:
+            try:
+                response = genai_client.models.generate_content(
+                    model=VERTEX_MODEL,
+                    contents=prompt,
+                    config=cfg,
+                )
+                text = getattr(response, "text", "") or ""
+                if text.strip():
+                    return {"answer": text.strip(), "sources": []}, None
+            except Exception as e:
+                last_error = e
+        return None, str(last_error) if last_error else "Vertex 검색 실패"
+
+    return await asyncio.to_thread(_run_vertex_search)
 
 
 def extract_tool_call_from_text(text: str):
@@ -1852,37 +1892,41 @@ async def search_chat(ctx, *, query: str = None):
 
         await search_msg.edit(content=f"🔍 검색 중... (`{search_query}`)")
 
-        # 2) web_search 실행
-        search_results, error = await google_search(search_query, num_results=5)
-        
-        if error:
-            await search_msg.edit(content=f"❌ {error}")
-            return
-        
-        if not search_results:
-            await search_msg.edit(content="❌ 검색 결과를 찾을 수 없습니다.")
-            return
-        
-        # 3) 검색 결과 컨텍스트 생성
-        search_context = "웹 검색 결과:\n\n"
-        for i, result in enumerate(search_results, 1):
-            search_context += f"[{i}] {result['title']}\n"
-            search_context += f"내용: {result['snippet']}\n"
-            search_context += f"링크: {result['link']}\n\n"
+        # 2) Vertex 검색 우선
+        vertex_result, vertex_error = await search_with_vertex(search_query)
+        ai_response = ""
+        if vertex_result and vertex_result.get("answer"):
+            ai_response = vertex_result["answer"].strip()
+            print(f"✅ 서치챗 Vertex 검색 사용: {search_query}")
+        else:
+            print(f"⚠️ 서치챗 Vertex 검색 실패, Custom Search 폴백: {vertex_error}")
+            await search_msg.edit(content=f"🔄 Vertex 검색 실패, 웹 검색으로 폴백 중... (`{search_query}`)")
 
-        # 도구 실행 결과 구조체 (참고 프로젝트 방식의 toolResult 유사)
-        tool_result = {
-            "success": True,
-            "tool": "web_search",
-            "query": search_query,
-            "results": search_results
-        }
+            # 3) 폴백: Custom Search
+            search_results, error = await google_search(search_query, num_results=5)
+            if error:
+                await search_msg.edit(content=f"❌ {error}")
+                return
+            if not search_results:
+                await search_msg.edit(content="❌ 검색 결과를 찾을 수 없습니다.")
+                return
 
-        # 4) 최종 자연어 응답 생성
-        memory_context = get_memory_context(ctx.author.id)
-        speech_style = get_speech_style_instruction(ctx.author.id)
-        
-        prompt = f"""{speech_style}{memory_context}
+            search_context = "웹 검색 결과:\n\n"
+            for i, result in enumerate(search_results, 1):
+                search_context += f"[{i}] {result['title']}\n"
+                search_context += f"내용: {result['snippet']}\n"
+                search_context += f"링크: {result['link']}\n\n"
+
+            tool_result = {
+                "success": True,
+                "tool": "web_search",
+                "query": search_query,
+                "results": search_results
+            }
+
+            memory_context = get_memory_context(ctx.author.id)
+            speech_style = get_speech_style_instruction(ctx.author.id)
+            prompt = f"""{speech_style}{memory_context}
 다음은 도구 실행 결과야:
 {json.dumps(tool_result, ensure_ascii=False, indent=2)}
 
@@ -1897,16 +1941,14 @@ async def search_chat(ctx, *, query: str = None):
 - 불확실하면 단정하지 말고 그렇게 명시
 - 마지막에 참고 링크를 최대 3개만 붙여
 """
-        
-        await search_msg.edit(content="🤖 AI가 답변 생성 중...")
-        
-        # AI 응답 생성
-        channel_id = ctx.channel.id
-        if channel_id not in chat_sessions:
-            chat_sessions[channel_id] = persona_model.start_chat(history=[])
-        
-        response = chat_sessions[channel_id].send_message(prompt)
-        ai_response = response.text.strip()
+            await search_msg.edit(content="🤖 AI가 답변 생성 중...")
+
+            channel_id = ctx.channel.id
+            if channel_id not in chat_sessions:
+                chat_sessions[channel_id] = persona_model.start_chat(history=[])
+
+            response = chat_sessions[channel_id].send_message(prompt)
+            ai_response = response.text.strip()
         
         if len(ai_response) > 1900:
             ai_response = ai_response[:1900] + "..."
