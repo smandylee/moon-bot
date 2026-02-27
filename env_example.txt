@@ -5,9 +5,25 @@ DISCORD_TOKEN=your_discord_bot_token_here
 # OpenAI API 키를 여기에 입력하세요
 OPENAI_API_KEY=your_openai_api_key_here
 
-# Gemini API 키를 여기에 입력하세요
-GEMINI_API_KEY=your_gemini_api_key_here
-
 # Wargaming API 키를 여기에 입력하세요
 # https://developers.wargaming.net/ 에서 발급받을 수 있습니다
 WARGAMING_API_KEY=your_wargaming_api_key_here
+
+# === Vertex AI (GCP) 설정 ===
+# 로컬 개발: gcp-key.json 파일을 프로젝트 폴더에 두면 자동으로 로드됨
+# Railway 등 서버 배포: 아래 환경변수에 JSON 키 전체 내용을 넣으세요
+GCP_KEY_JSON={"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}
+
+# === Civitai 이미지 생성 설정 ===
+# https://civitai.com/user/account 에서 API 토큰 발급
+CIVITAI_API_TOKEN=de0eab7ded2f683a1e854b3adcb53b09
+# 기본 모델(옵션): 비우면 코드 기본값 사용
+CIVITAI_MODEL_URN=urn:air:sd1:checkpoint:civitai:15003@2681234
+# 기본 LoRA(옵션): 기본적으로 항상 적용
+CIVITAI_DEFAULT_LORA_URN=urn:air:sd1:lora:civitai:162141@182559
+# LoRA 강도(0.0~2.0 권장)
+CIVITAI_DEFAULT_LORA_STRENGTH=0.8
+# 이름 프리셋(JSON): 명령어에서 URN 대신 이름으로 선택
+# 예) --model 실사 --lora 얼굴보정:0.8
+CIVITAI_MODEL_PRESETS_JSON={"실사":"urn:air:sd1:checkpoint:civitai:15003@2681234","애니":"urn:air:sd1:checkpoint:civitai:4201@130072"}
+CIVITAI_LORA_PRESETS_JSON={"얼굴보정":"urn:air:sd1:lora:civitai:162141@182559"}

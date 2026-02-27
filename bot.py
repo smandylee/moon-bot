@@ -13,7 +13,9 @@ import asyncio
 import threading
 import queue
 import time
+import shlex
 import aiohttp
+from urllib.parse import urlparse
 from types import SimpleNamespace
 
 # Gemini( Vertex AI 모드 ) 설정
@@ -707,6 +709,356 @@ async def send_image_embed(channel, image_url, title="이미지", description=""
         print(f"웹훅 전송 오류: {e}")
         # 웹훅 실패시 일반 메시지로 대체
         await channel.send(f"📷 **{title}**\n{description}\n{image_url}")
+
+
+def _extract_image_urls(data):
+    """Civitai 응답에서 이미지 URL 목록을 재귀적으로 추출"""
+    urls = []
+
+    def walk(value):
+        if value is None:
+            return
+
+        if isinstance(value, str):
+            if value.startswith("http://") or value.startswith("https://"):
+                parsed = urlparse(value)
+                if parsed.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    urls.append(value)
+            return
+
+        if isinstance(value, dict):
+            for key in ("url", "imageUrl", "image_url", "src", "href"):
+                if key in value:
+                    walk(value[key])
+            for v in value.values():
+                walk(v)
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+
+        if hasattr(value, "__dict__"):
+            walk(vars(value))
+
+    walk(data)
+    return list(dict.fromkeys(urls))
+
+
+def _load_named_presets():
+    """환경변수 기반 모델/LoRA 이름 프리셋 로드"""
+    model_presets = {}
+    lora_presets = {}
+
+    raw_model_json = os.getenv("CIVITAI_MODEL_PRESETS_JSON", "").strip()
+    raw_lora_json = os.getenv("CIVITAI_LORA_PRESETS_JSON", "").strip()
+
+    if raw_model_json:
+        try:
+            parsed = json.loads(raw_model_json)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        model_presets[k] = v
+        except Exception as e:
+            print(f"모델 프리셋 JSON 파싱 실패: {e}")
+
+    if raw_lora_json:
+        try:
+            parsed = json.loads(raw_lora_json)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        lora_presets[k] = v
+        except Exception as e:
+            print(f"LoRA 프리셋 JSON 파싱 실패: {e}")
+
+    return model_presets, lora_presets
+
+
+def _resolve_name_or_urn(value: str, presets: dict, kind: str):
+    """URN 직접 입력 또는 이름 프리셋을 URN으로 변환"""
+    if not value:
+        return None, f"{kind} 값이 비어 있어."
+
+    candidate = value.strip()
+    if candidate.startswith("urn:"):
+        return candidate, None
+
+    lower_map = {k.lower(): v for k, v in presets.items()}
+    resolved = lower_map.get(candidate.lower())
+    if resolved:
+        return resolved, None
+
+    available = ", ".join(presets.keys()) if presets else "(없음)"
+    return None, f"{kind} 프리셋 '{candidate}'을(를) 찾지 못했어. 사용 가능: {available}"
+
+
+def _parse_civitai_command_args(raw: str):
+    """
+    .이미지생성 옵션 파서
+    지원:
+    - --model <이름 또는 URN>
+    - --lora <이름 또는 URN[:strength]> (여러 번 사용 가능)
+    - --size <WIDTHxHEIGHT> (예: 768x1024)
+    - --steps <int>
+    - --cfg <float>
+    - --no-default-lora
+    """
+    try:
+        tokens = shlex.split(raw)
+    except Exception:
+        return None, "명령어 파싱 실패: 따옴표를 확인해줘."
+
+    model = None
+    loras = []  # [{"urn": str, "strength": float}]
+    width = None
+    height = None
+    steps = 24
+    cfg_scale = 7.0
+    use_default_lora = True
+    prompt_tokens = []
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--model":
+            if i + 1 >= len(tokens):
+                return None, "--model 뒤에 모델 이름 또는 URN이 필요해."
+            model = tokens[i + 1]
+            i += 2
+            continue
+        if t == "--lora":
+            if i + 1 >= len(tokens):
+                return None, "--lora 뒤에 LoRA 이름/URN 또는 이름/URN:강도가 필요해."
+            value = tokens[i + 1]
+            if ":" in value:
+                urn, s = value.rsplit(":", 1)
+                try:
+                    strength = float(s)
+                except Exception:
+                    return None, f"LoRA 강도 파싱 실패: {value}"
+            else:
+                urn = value
+                strength = 0.8
+            strength = max(0.0, min(strength, 2.0))
+            loras.append({"urn": urn, "strength": strength})
+            i += 2
+            continue
+        if t == "--size":
+            if i + 1 >= len(tokens):
+                return None, "--size 뒤에 768x1024 형식이 필요해."
+            size = tokens[i + 1].lower()
+            if "x" not in size:
+                return None, "--size는 768x1024 형식으로 입력해줘."
+            w, h = size.split("x", 1)
+            try:
+                width = int(w)
+                height = int(h)
+            except Exception:
+                return None, "--size 숫자 파싱 실패."
+            i += 2
+            continue
+        if t == "--steps":
+            if i + 1 >= len(tokens):
+                return None, "--steps 뒤에 숫자가 필요해."
+            try:
+                steps = int(tokens[i + 1])
+            except Exception:
+                return None, "--steps 숫자 파싱 실패."
+            i += 2
+            continue
+        if t == "--cfg":
+            if i + 1 >= len(tokens):
+                return None, "--cfg 뒤에 숫자가 필요해."
+            try:
+                cfg_scale = float(tokens[i + 1])
+            except Exception:
+                return None, "--cfg 숫자 파싱 실패."
+            i += 2
+            continue
+        if t == "--no-default-lora":
+            use_default_lora = False
+            i += 1
+            continue
+
+        prompt_tokens.append(t)
+        i += 1
+
+    prompt = " ".join(prompt_tokens).strip()
+    if not prompt:
+        return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
+
+    return {
+        "prompt": prompt,
+        "model": model,
+        "loras": loras,
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "cfg_scale": cfg_scale,
+        "use_default_lora": use_default_lora,
+    }, None
+
+
+@bot.command(name='이미지생성')
+async def civitai_generate_image(ctx, *, prompt: str = None):
+    """Civitai 이미지 생성 명령어"""
+    if not prompt:
+        await ctx.send(
+            "사용법: `.이미지생성 [프롬프트] [옵션]`\n"
+            "옵션: `--model 이름/URN`, `--lora 이름/URN[:강도]`(반복 가능), `--size 768x1024`, `--steps 24`, `--cfg 7`, `--no-default-lora`\n"
+            "예시: `.이미지생성 \"cinematic portrait\" --model 실사 --lora 얼굴보정:0.9 --size 768x1024`\n"
+            "프리셋 목록: `.이미지프리셋`"
+        )
+        return
+
+    civitai_token = os.getenv("CIVITAI_API_TOKEN")
+    if not civitai_token:
+        await ctx.send("❌ `CIVITAI_API_TOKEN`이 설정되지 않았어. Railway 변수에 추가해줘.")
+        return
+
+    parsed, parse_error = _parse_civitai_command_args(prompt)
+    if parse_error:
+        await ctx.send(f"❌ {parse_error}")
+        return
+
+    model_presets, lora_presets = _load_named_presets()
+
+    default_model_urn = os.getenv("CIVITAI_MODEL_URN", "urn:air:sd1:checkpoint:civitai:4201@130072")
+    default_lora_urn = os.getenv("CIVITAI_DEFAULT_LORA_URN", "urn:air:sd1:lora:civitai:162141@182559")
+    try:
+        default_lora_strength = float(os.getenv("CIVITAI_DEFAULT_LORA_STRENGTH", "0.8"))
+    except Exception:
+        default_lora_strength = 0.8
+    default_lora_strength = max(0.0, min(default_lora_strength, 2.0))
+
+    model_input = parsed["model"] or default_model_urn
+    model_urn, model_error = _resolve_name_or_urn(model_input, model_presets, "모델")
+    if model_error:
+        await ctx.send(f"❌ {model_error}")
+        return
+
+    loading_msg = await ctx.reply("🎨 Civitai에 이미지 생성 요청 중...")
+
+    try:
+        def _create_job():
+            os.environ["CIVITAI_API_TOKEN"] = civitai_token
+            import civitai
+
+            payload = {
+                "model": model_urn,
+                "params": {
+                    "prompt": parsed["prompt"],
+                    "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
+                    "scheduler": "EulerA",
+                    "steps": parsed["steps"],
+                    "cfgScale": parsed["cfg_scale"],
+                    "width": parsed["width"] or 768,
+                    "height": parsed["height"] or 1024,
+                    "clipSkip": 2
+                }
+            }
+
+            additional_networks = {}
+            if parsed["use_default_lora"] and default_lora_urn:
+                resolved_default_lora, default_lora_error = _resolve_name_or_urn(default_lora_urn, lora_presets, "기본 LoRA")
+                if default_lora_error:
+                    raise ValueError(default_lora_error)
+                additional_networks[resolved_default_lora] = {
+                    "type": "Lora",
+                    "strength": default_lora_strength
+                }
+
+            for lora in parsed["loras"]:
+                resolved_lora_urn, lora_error = _resolve_name_or_urn(lora["urn"], lora_presets, "LoRA")
+                if lora_error:
+                    raise ValueError(lora_error)
+                additional_networks[resolved_lora_urn] = {
+                    "type": "Lora",
+                    "strength": lora["strength"]
+                }
+
+            if additional_networks:
+                payload["additionalNetworks"] = additional_networks
+
+            return civitai.image.create(payload)
+        job_response = await asyncio.to_thread(_create_job)
+
+        image_urls = _extract_image_urls(job_response)
+        if image_urls:
+            await loading_msg.edit(content="✅ 이미지 생성 완료!")
+            await send_image_embed(
+                ctx.channel,
+                image_urls[0],
+                title="🎨 Civitai 생성 이미지",
+                description=f"프롬프트: {parsed['prompt'][:180]}"
+            )
+            return
+
+        token = None
+        job_id = None
+        if isinstance(job_response, dict):
+            token = job_response.get("token")
+            job_id = job_response.get("id") or job_response.get("jobId")
+        else:
+            token = getattr(job_response, "token", None)
+            job_id = getattr(job_response, "id", None) or getattr(job_response, "jobId", None)
+
+        if not token and not job_id:
+            await loading_msg.edit(content="❌ Civitai 응답에서 작업 식별자(token/id)를 찾지 못했어.")
+            return
+
+        await loading_msg.edit(content="⏳ 이미지 생성 중... (최대 2분 대기)")
+
+        def _get_job_status(token_value, job_id_value):
+            import civitai
+            if token_value:
+                return civitai.jobs.get(token=token_value)
+            return civitai.jobs.get(id=job_id_value)
+
+        final_urls = []
+        for _ in range(60):
+            await asyncio.sleep(2)
+            status = await asyncio.to_thread(_get_job_status, token, job_id)
+            final_urls = _extract_image_urls(status)
+            if final_urls:
+                break
+
+        if not final_urls:
+            await loading_msg.edit(content="⚠️ 생성 요청은 접수됐지만 아직 결과 이미지가 준비되지 않았어. 잠시 후 다시 시도해줘.")
+            return
+
+        await loading_msg.edit(content="✅ 이미지 생성 완료!")
+        await send_image_embed(
+            ctx.channel,
+            final_urls[0],
+            title="🎨 Civitai 생성 이미지",
+            description=f"프롬프트: {parsed['prompt'][:180]}"
+        )
+    except Exception as e:
+        await loading_msg.edit(content=f"❌ 이미지 생성 오류: {str(e)[:250]}")
+        print(f"Civitai 이미지 생성 오류: {e}")
+
+
+@bot.command(name='이미지프리셋')
+async def civitai_presets(ctx):
+    """등록된 Civitai 모델/LoRA 이름 프리셋 출력"""
+    model_presets, lora_presets = _load_named_presets()
+
+    model_lines = [f"- {name}" for name in model_presets.keys()] if model_presets else ["- (없음)"]
+    lora_lines = [f"- {name}" for name in lora_presets.keys()] if lora_presets else ["- (없음)"]
+
+    msg = (
+        "🧩 **Civitai 프리셋 목록**\n\n"
+        "**모델 이름**\n" + "\n".join(model_lines[:30]) + "\n\n"
+        "**LoRA 이름**\n" + "\n".join(lora_lines[:30]) + "\n\n"
+        "사용 예시:\n"
+        "`.이미지생성 \"cinematic portrait\" --model 실사 --lora 얼굴보정:0.8`\n"
+        "프리셋은 환경변수 `CIVITAI_MODEL_PRESETS_JSON`, `CIVITAI_LORA_PRESETS_JSON`에 JSON으로 등록하면 돼."
+    )
+    await ctx.send(msg)
 
 @bot.command(name='랜덤')
 async def random_message(ctx):
@@ -4499,6 +4851,8 @@ async def help_command(ctx):
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
 `.점메추` - 오늘 점심 뭐 먹을지 추천해줌
 `.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
+`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (이름 프리셋/URN 선택 가능)
+`.이미지프리셋` - 등록된 모델/LoRA 이름 프리셋 보기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.인성진단 [@유저명]` - 채팅 패턴으로 인성 분석 (개재밌음)
 `.부검 [검색어]` - 키워드 또는 상황으로 메시지 검색 (개유용함)
