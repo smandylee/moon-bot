@@ -953,7 +953,12 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
         )
         return
 
-    civitai_token = os.getenv("CIVITAI_API_TOKEN")
+    civitai_token = (os.getenv("CIVITAI_API_TOKEN") or "").strip()
+    # Railway 변수에 따옴표로 감싸 넣은 실수를 최대한 흡수
+    if (civitai_token.startswith('"') and civitai_token.endswith('"')) or (
+        civitai_token.startswith("'") and civitai_token.endswith("'")
+    ):
+        civitai_token = civitai_token[1:-1].strip()
     if not civitai_token:
         await ctx.send("❌ `CIVITAI_API_TOKEN`이 설정되지 않았어. Railway 변수에 추가해줘.")
         return
@@ -994,11 +999,14 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             "size": f"{parsed['width'] or 768}x{parsed['height'] or 1024}",
             "steps": parsed["steps"],
             "cfg": parsed["cfg_scale"],
+            "token_len": len(civitai_token),
+            "token_suffix": civitai_token[-4:] if len(civitai_token) >= 4 else "(short)",
         }
 
         def _create_job():
             os.environ["CIVITAI_API_TOKEN"] = civitai_token
             import civitai
+            civitai_client = civitai.Civitai()
 
             payload = {
                 "model": model_urn,
@@ -1036,7 +1044,7 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             if additional_networks:
                 payload["additionalNetworks"] = additional_networks
 
-            return civitai.image.create(payload)
+            return civitai_client.image.create(payload)
         job_response = await asyncio.to_thread(_create_job)
 
         image_urls = _extract_image_urls(job_response)
@@ -1066,10 +1074,12 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
         await loading_msg.edit(content="⏳ 이미지 생성 중... (최대 2분 대기)")
 
         def _get_job_status(token_value, job_id_value):
+            os.environ["CIVITAI_API_TOKEN"] = civitai_token
             import civitai
+            civitai_client = civitai.Civitai()
             if token_value:
-                return civitai.jobs.get(token=token_value)
-            return civitai.jobs.get(id=job_id_value)
+                return civitai_client.jobs.get(token=token_value)
+            return civitai_client.jobs.get(job_id=job_id_value)
 
         final_urls = []
         for _ in range(60):
@@ -1092,8 +1102,22 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
         )
     except Exception as e:
         # Civitai/HTTP 오류 상세 추출
-        status_code = None
+        status_code = getattr(e, "status_code", None)
         error_body = ""
+
+        # civitai.api_config.HTTPException는 args[0]에 상태코드가 들어올 수 있음
+        if status_code is None and getattr(e, "args", None):
+            try:
+                first_arg = e.args[0]
+                if isinstance(first_arg, int):
+                    status_code = first_arg
+                elif isinstance(first_arg, str):
+                    match = re.search(r"\b(\d{3})\b", first_arg)
+                    if match:
+                        status_code = int(match.group(1))
+            except Exception:
+                pass
+
         if hasattr(e, "response") and getattr(e, "response", None) is not None:
             try:
                 status_code = getattr(e.response, "status_code", None)
@@ -1109,7 +1133,14 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             pass
 
         user_error = f"❌ 이미지 생성 오류: {str(e)[:250]}"
-        if status_code:
+        if status_code == 403:
+            user_error = (
+                "❌ Civitai 인증/권한 오류(HTTP 403)\n"
+                "- `CIVITAI_API_TOKEN` 값을 다시 발급 후 재설정\n"
+                "- Railway 재배포(프로세스 재시작) 후 재시도\n"
+                "- 계정 크레딧/생성 권한/모델 접근 권한 확인"
+            )
+        elif status_code:
             user_error += f" (HTTP {status_code})"
         await loading_msg.edit(content=user_error)
 
