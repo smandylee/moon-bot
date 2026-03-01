@@ -1003,49 +1003,85 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             "token_suffix": civitai_token[-4:] if len(civitai_token) >= 4 else "(short)",
         }
 
+        payload = {
+            "model": model_urn,
+            "params": {
+                "prompt": final_prompt,
+                "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
+                "scheduler": "EulerA",
+                "steps": parsed["steps"],
+                "cfgScale": parsed["cfg_scale"],
+                "width": parsed["width"] or 768,
+                "height": parsed["height"] or 1024,
+                "clipSkip": 2
+            }
+        }
+
+        additional_networks = {}
+        if parsed["use_default_lora"] and default_lora_urn:
+            resolved_default_lora, default_lora_error = _resolve_name_or_urn(default_lora_urn, lora_presets, "기본 LoRA")
+            if default_lora_error:
+                raise ValueError(default_lora_error)
+            additional_networks[resolved_default_lora] = {
+                "type": "Lora",
+                "strength": default_lora_strength
+            }
+
+        for lora in parsed["loras"]:
+            resolved_lora_urn, lora_error = _resolve_name_or_urn(lora["urn"], lora_presets, "LoRA")
+            if lora_error:
+                raise ValueError(lora_error)
+            additional_networks[resolved_lora_urn] = {
+                "type": "Lora",
+                "strength": lora["strength"]
+            }
+
+        if additional_networks:
+            payload["additionalNetworks"] = additional_networks
+
         def _create_job():
             os.environ["CIVITAI_API_TOKEN"] = civitai_token
             import civitai
             civitai_client = civitai.Civitai()
-
-            payload = {
-                "model": model_urn,
-                "params": {
-                    "prompt": final_prompt,
-                    "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
-                    "scheduler": "EulerA",
-                    "steps": parsed["steps"],
-                    "cfgScale": parsed["cfg_scale"],
-                    "width": parsed["width"] or 768,
-                    "height": parsed["height"] or 1024,
-                    "clipSkip": 2
-                }
-            }
-
-            additional_networks = {}
-            if parsed["use_default_lora"] and default_lora_urn:
-                resolved_default_lora, default_lora_error = _resolve_name_or_urn(default_lora_urn, lora_presets, "기본 LoRA")
-                if default_lora_error:
-                    raise ValueError(default_lora_error)
-                additional_networks[resolved_default_lora] = {
-                    "type": "Lora",
-                    "strength": default_lora_strength
-                }
-
-            for lora in parsed["loras"]:
-                resolved_lora_urn, lora_error = _resolve_name_or_urn(lora["urn"], lora_presets, "LoRA")
-                if lora_error:
-                    raise ValueError(lora_error)
-                additional_networks[resolved_lora_urn] = {
-                    "type": "Lora",
-                    "strength": lora["strength"]
-                }
-
-            if additional_networks:
-                payload["additionalNetworks"] = additional_networks
-
             return civitai_client.image.create(payload)
-        job_response = await asyncio.to_thread(_create_job)
+
+        async def _create_job_via_rest():
+            base_model = "SDXL" if "sdxl" in model_urn.lower() else "SD_1_5"
+            job_input = {
+                "$type": "textToImage",
+                "baseModel": base_model,
+                **payload,
+            }
+            url = "https://orchestration.civitai.com/v1/consumer/jobs"
+            headers = {
+                "Authorization": f"Bearer {civitai_token}",
+                "Content-Type": "application/json",
+            }
+            timeout = aiohttp.ClientTimeout(total=40)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=job_input, params={"wait": "false"}) as resp:
+                    raw_text = await resp.text()
+                    parsed_body = None
+                    try:
+                        parsed_body = json.loads(raw_text) if raw_text else {}
+                    except Exception:
+                        parsed_body = {"raw": raw_text}
+
+                    if resp.status >= 400:
+                        cf_ray = resp.headers.get("cf-ray")
+                        server_name = resp.headers.get("server")
+                        body_excerpt = (raw_text or "")[:2000]
+                        raise RuntimeError(
+                            f"REST create failed (HTTP {resp.status})"
+                            f" cf-ray={cf_ray} server={server_name} body={body_excerpt}"
+                        )
+                    return parsed_body
+
+        try:
+            job_response = await asyncio.to_thread(_create_job)
+        except Exception as sdk_create_error:
+            print(f"SDK 생성 실패, REST fallback 시도: {sdk_create_error}")
+            job_response = await _create_job_via_rest()
 
         image_urls = _extract_image_urls(job_response)
         if image_urls:
