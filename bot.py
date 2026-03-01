@@ -723,12 +723,20 @@ def _extract_image_urls(data):
         if isinstance(value, str):
             if value.startswith("http://") or value.startswith("https://"):
                 parsed = urlparse(value)
-                if parsed.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                path = (parsed.path or "").lower()
+                # Civitai 결과 URL은 확장자가 없거나 쿼리스트링 기반일 수 있어 완화 처리
+                if (
+                    path.endswith((".png", ".jpg", ".jpeg", ".webp"))
+                    or "blob" in path
+                    or "image" in path
+                    or "s3" in (parsed.netloc or "").lower()
+                    or "cloudfront" in (parsed.netloc or "").lower()
+                ):
                     urls.append(value)
             return
 
         if isinstance(value, dict):
-            for key in ("url", "imageUrl", "image_url", "src", "href"):
+            for key in ("url", "imageUrl", "image_url", "blobUrl", "blob_url", "src", "href"):
                 if key in value:
                     walk(value[key])
             for v in value.values():
@@ -861,6 +869,8 @@ def _parse_civitai_command_args(raw: str):
                 height = int(h)
             except Exception:
                 return None, "--size 숫자 파싱 실패."
+            if not (1 <= width <= 1024 and 1 <= height <= 1024):
+                return None, "--size 범위 오류: 가로/세로는 각각 1~1024 사이여야 해."
             i += 2
             continue
         if t == "--steps":
@@ -1170,12 +1180,20 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
 
         user_error = f"❌ 이미지 생성 오류: {str(e)[:250]}"
         if status_code == 403:
-            user_error = (
-                "❌ Civitai 인증/권한 오류(HTTP 403)\n"
-                "- `CIVITAI_API_TOKEN` 값을 다시 발급 후 재설정\n"
-                "- Railway 재배포(프로세스 재시작) 후 재시도\n"
-                "- 계정 크레딧/생성 권한/모델 접근 권한 확인"
-            )
+            lowered_body = (error_body or "").lower()
+            if "insufficient buzz" in lowered_body:
+                user_error = (
+                    "❌ Civitai 생성 실패: API 사용 가능 Buzz가 부족해.\n"
+                    "- 계정에 Yellow(금색) Buzz/사용 가능한 Buzz 충전\n"
+                    "- 동일 계정으로 발급한 API 키인지 확인 후 재시도"
+                )
+            else:
+                user_error = (
+                    "❌ Civitai 인증/권한 오류(HTTP 403)\n"
+                    "- `CIVITAI_API_TOKEN` 값을 다시 발급 후 재설정\n"
+                    "- Railway 재배포(프로세스 재시작) 후 재시도\n"
+                    "- 계정 크레딧/생성 권한/모델 접근 권한 확인"
+                )
         elif status_code:
             user_error += f" (HTTP {status_code})"
         await loading_msg.edit(content=user_error)
