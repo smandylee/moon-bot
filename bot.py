@@ -1727,7 +1727,9 @@ async def on_message(message):
     # 이재용
     if "이재용" in message.content:
         await message.channel.send("이젖뀨 여미새련")
-    
+    # 박민제
+    if "민제" in message.content:
+        await message.channel.send("박민제 시발 권문얼굴같은련")
     # 뮤트 기능 - "@유저명 5분동안 닥쳐" 패턴 감지
     import re
     
