@@ -13,6 +13,9 @@ WARGAMING_API_KEY=your_wargaming_api_key_here
 # 로컬 개발: gcp-key.json 파일을 프로젝트 폴더에 두면 자동으로 로드됨
 # Railway 등 서버 배포: 아래 환경변수에 JSON 키 전체 내용을 넣으세요
 GCP_KEY_JSON={"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}
+# Gemini 모델 ID (이미지 프롬프트 변환, 페르소나, 인성진단, 서치챗 등 전 기능 공통)
+VERTEX_MODEL=gemini-3.5-flash
+# GCP_LOCATION=global
 
 # === Civitai 이미지 생성 설정 ===
 # https://civitai.com/user/account 에서 API 토큰 발급

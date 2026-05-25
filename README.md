@@ -107,7 +107,7 @@ Use these commands in your Discord channel:
 - Customize game mention messages in the respective command functions
 
 ### API Integration
-- The bot supports both OpenAI GPT and Google Gemini AI
+- The bot supports both OpenAI GPT and Google Gemini AI (Vertex: `gemini-3.5-flash` by default via `VERTEX_MODEL`)
 - Configure API keys in the `.env` file for full functionality
 
 ## 📁 Project Structure

@@ -19,7 +19,7 @@ import traceback
 from urllib.parse import urlparse
 from types import SimpleNamespace
 
-# Gemini( Vertex AI 모드 ) 설정
+# Gemini (Vertex AI, VERTEX_MODEL 공통) 설정
 try:
     from google import genai
 except Exception:
@@ -48,8 +48,8 @@ openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
 
 # Vertex AI 초기화 (google-genai SDK, Vertex 모드)
 GCP_PROJECT_ID = "alphavertex-486307"
-GCP_LOCATION = "global"  # Gemini 3 Flash Preview 권장
-VERTEX_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global")  # Gemini 3.5 Flash 권장: global
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-3.5-flash")  # Vertex/Gemini 모델 ID (전 기능 공통)
 
 # 서비스 계정 키 파일 경로 설정
 GCP_KEY_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'gcp-key.json')
@@ -178,7 +178,10 @@ if HAS_GCP_CREDENTIALS and genai is not None:
             location=GCP_LOCATION,
         )
         gemini_model = GenerativeModel(VERTEX_MODEL, client=genai_client)
-        print(f"✅ Vertex AI 초기화 완료 (google-genai, 프로젝트: {GCP_PROJECT_ID}, 리전: {GCP_LOCATION})")
+        print(
+            f"✅ Vertex AI 초기화 완료 (google-genai, 모델: {VERTEX_MODEL}, "
+            f"프로젝트: {GCP_PROJECT_ID}, 리전: {GCP_LOCATION})"
+        )
     except Exception as e:
         print(f"❌ Vertex AI 초기화 실패: {e}")
         gemini_model = None
@@ -804,6 +807,37 @@ def _resolve_name_or_urn(value: str, presets: dict, kind: str):
     return None, f"{kind} 프리셋 '{candidate}'을(를) 찾지 못했어. 사용 가능: {available}"
 
 
+def _extract_inline_model_from_prompt(prompt_text: str, model_presets: dict):
+    """프롬프트 본문에서 인라인 모델 지정 추출 (예: '실사 고양이', '실사: 고양이')"""
+    if not prompt_text:
+        return None, prompt_text
+    if not model_presets:
+        return None, prompt_text
+
+    text = prompt_text.strip()
+    if not text:
+        return None, prompt_text
+
+    presets_lower = {k.lower(): k for k in model_presets.keys()}
+
+    # 1) "모델명: 프롬프트"
+    if ":" in text:
+        maybe_model, rest = text.split(":", 1)
+        model_key = presets_lower.get(maybe_model.strip().lower())
+        if model_key and rest.strip():
+            return model_key, rest.strip()
+
+    # 2) "모델명 프롬프트" (첫 토큰이 프리셋 이름일 때)
+    parts = text.split(maxsplit=1)
+    if parts:
+        model_key = presets_lower.get(parts[0].strip().lower())
+        if model_key:
+            remaining = parts[1].strip() if len(parts) > 1 else ""
+            return model_key, remaining
+
+    return None, prompt_text
+
+
 def _parse_civitai_command_args(raw: str):
     """
     .이미지생성 옵션 파서
@@ -816,17 +850,24 @@ def _parse_civitai_command_args(raw: str):
     - --no-default-lora
     - --raw (자연어 프롬프트 자동 변환 비활성화)
     """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
+
     try:
         tokens = shlex.split(raw)
     except Exception:
-        return None, "명령어 파싱 실패: 따옴표를 확인해줘."
+        # 따옴표가 깨진 입력도 최대한 살려서 자연어 우선으로 처리
+        tokens = raw.split()
+        if not tokens:
+            return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
 
     model = None
     loras = []  # [{"urn": str, "strength": float}]
     width = None
     height = None
-    steps = 24
-    cfg_scale = 7.0
+    steps = None
+    cfg_scale = None
     use_default_lora = True
     raw_mode = False
     prompt_tokens = []
@@ -880,6 +921,8 @@ def _parse_civitai_command_args(raw: str):
                 steps = int(tokens[i + 1])
             except Exception:
                 return None, "--steps 숫자 파싱 실패."
+            if not (1 <= steps <= 50):
+                return None, "--steps 범위 오류: 1~50 사이로 입력해줘."
             i += 2
             continue
         if t == "--cfg":
@@ -889,6 +932,8 @@ def _parse_civitai_command_args(raw: str):
                 cfg_scale = float(tokens[i + 1])
             except Exception:
                 return None, "--cfg 숫자 파싱 실패."
+            if not (1.0 <= cfg_scale <= 20.0):
+                return None, "--cfg 범위 오류: 1.0~20.0 사이로 입력해줘."
             i += 2
             continue
         if t == "--no-default-lora":
@@ -904,6 +949,11 @@ def _parse_civitai_command_args(raw: str):
         i += 1
 
     prompt = " ".join(prompt_tokens).strip()
+    if len(prompt) >= 2 and (
+        (prompt.startswith('"') and prompt.endswith('"'))
+        or (prompt.startswith("'") and prompt.endswith("'"))
+    ):
+        prompt = prompt[1:-1].strip()
     if not prompt:
         return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
 
@@ -956,9 +1006,11 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
     """Civitai 이미지 생성 명령어"""
     if not prompt:
         await ctx.send(
-            "사용법: `.이미지생성 [프롬프트] [옵션]`\n"
-            "옵션: `--model 이름/URN`, `--lora 이름/URN[:강도]`(반복 가능), `--size 768x1024`, `--steps 24`, `--cfg 7`, `--no-default-lora`\n"
-            "예시: `.이미지생성 \"cinematic portrait\" --model 실사 --lora 얼굴보정:0.9 --size 768x1024`\n"
+            "사용법(자연어 우선): `.이미지생성 [프롬프트]`\n"
+            "옵션(필요할 때만): `--model 이름/URN`, `--lora 이름/URN[:강도]`(반복 가능), `--size 768x1024`, `--steps 24`, `--cfg 7`, `--no-default-lora`, `--raw`\n"
+            "빠른 예시: `.이미지생성 cinematic portrait`\n"
+            "모델+자연어 예시: `.이미지생성 실사 cinematic portrait`\n"
+            "고급 예시: `.이미지생성 cinematic portrait --model 실사 --lora 얼굴보정:0.9 --size 768x1024`\n"
             "프리셋 목록: `.이미지프리셋`"
         )
         return
@@ -983,10 +1035,39 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
     default_model_urn = os.getenv("CIVITAI_MODEL_URN", "urn:air:sd1:checkpoint:civitai:4201@130072")
     default_lora_urn = os.getenv("CIVITAI_DEFAULT_LORA_URN", "urn:air:sd1:lora:civitai:162141@182559")
     try:
+        default_width = int(os.getenv("CIVITAI_DEFAULT_WIDTH", "768"))
+    except Exception:
+        default_width = 768
+    try:
+        default_height = int(os.getenv("CIVITAI_DEFAULT_HEIGHT", "1024"))
+    except Exception:
+        default_height = 1024
+    try:
+        default_steps = int(os.getenv("CIVITAI_DEFAULT_STEPS", "24"))
+    except Exception:
+        default_steps = 24
+    try:
+        default_cfg_scale = float(os.getenv("CIVITAI_DEFAULT_CFG_SCALE", "7.0"))
+    except Exception:
+        default_cfg_scale = 7.0
+
+    default_width = max(1, min(default_width, 1024))
+    default_height = max(1, min(default_height, 1024))
+    default_steps = max(1, min(default_steps, 50))
+    default_cfg_scale = max(1.0, min(default_cfg_scale, 20.0))
+
+    try:
         default_lora_strength = float(os.getenv("CIVITAI_DEFAULT_LORA_STRENGTH", "0.8"))
     except Exception:
         default_lora_strength = 0.8
     default_lora_strength = max(0.0, min(default_lora_strength, 2.0))
+
+    # --model 없이도 "실사 고양이" / "실사: 고양이" 형태를 지원
+    if not parsed["model"]:
+        inline_model, inline_prompt = _extract_inline_model_from_prompt(parsed["prompt"], model_presets)
+        if inline_model:
+            parsed["model"] = inline_model
+            parsed["prompt"] = inline_prompt
 
     model_input = parsed["model"] or default_model_urn
     model_urn, model_error = _resolve_name_or_urn(model_input, model_presets, "모델")
@@ -994,11 +1075,33 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
         await ctx.send(f"❌ {model_error}")
         return
 
+    if not parsed["prompt"].strip():
+        await ctx.send("❌ 프롬프트가 비어 있어. 모델명 뒤에 생성할 내용을 같이 입력해줘.")
+        return
+
+    effective_width = parsed["width"] if parsed["width"] is not None else default_width
+    effective_height = parsed["height"] if parsed["height"] is not None else default_height
+    effective_steps = parsed["steps"] if parsed["steps"] is not None else default_steps
+    effective_cfg_scale = parsed["cfg_scale"] if parsed["cfg_scale"] is not None else default_cfg_scale
+
     final_prompt = parsed["prompt"]
-    loading_msg = await ctx.reply("🎨 프롬프트 정리 중...")
+    natural_only_input = "--" not in (prompt or "")
+    if natural_only_input:
+        loading_msg = await ctx.reply("🎨 자연어 입력 확인 완료. 기본 설정으로 생성 준비 중...")
+    else:
+        loading_msg = await ctx.reply("🎨 이미지 생성 요청 준비 중...")
+
     if not parsed["raw_mode"]:
+        await loading_msg.edit(content="🎨 프롬프트 정리 중...")
         final_prompt = await _build_civitai_prompt(parsed["prompt"])
-    await loading_msg.edit(content="🎨 Civitai에 이미지 생성 요청 중...")
+
+    size_text = f"{effective_width}x{effective_height}"
+    await loading_msg.edit(
+        content=(
+            f"🎨 Civitai에 이미지 생성 요청 중... "
+            f"(model: {model_urn.split(':')[-1]}, size: {size_text}, steps: {effective_steps})"
+        )
+    )
 
     try:
         debug_context = {
@@ -1006,9 +1109,9 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
             "raw_mode": parsed["raw_mode"],
             "use_default_lora": parsed["use_default_lora"],
             "loras": [l["urn"] for l in parsed["loras"]],
-            "size": f"{parsed['width'] or 768}x{parsed['height'] or 1024}",
-            "steps": parsed["steps"],
-            "cfg": parsed["cfg_scale"],
+            "size": f"{effective_width}x{effective_height}",
+            "steps": effective_steps,
+            "cfg": effective_cfg_scale,
             "token_len": len(civitai_token),
             "token_suffix": civitai_token[-4:] if len(civitai_token) >= 4 else "(short)",
         }
@@ -1019,10 +1122,10 @@ async def civitai_generate_image(ctx, *, prompt: str = None):
                 "prompt": final_prompt,
                 "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
                 "scheduler": "EulerA",
-                "steps": parsed["steps"],
-                "cfgScale": parsed["cfg_scale"],
-                "width": parsed["width"] or 768,
-                "height": parsed["height"] or 1024,
+                "steps": effective_steps,
+                "cfgScale": effective_cfg_scale,
+                "width": effective_width,
+                "height": effective_height,
                 "clipSkip": 2
             }
         }
@@ -1221,7 +1324,9 @@ async def civitai_presets(ctx):
         "**모델 이름**\n" + "\n".join(model_lines[:30]) + "\n\n"
         "**LoRA 이름**\n" + "\n".join(lora_lines[:30]) + "\n\n"
         "사용 예시:\n"
-        "`.이미지생성 \"cinematic portrait\" --model 실사 --lora 얼굴보정:0.8`\n"
+        "`.이미지생성 cinematic portrait`\n"
+        "`.이미지생성 실사 cinematic portrait`\n"
+        "`.이미지생성 cinematic portrait --model 실사 --lora 얼굴보정:0.8`\n"
         "프리셋은 환경변수 `CIVITAI_MODEL_PRESETS_JSON`, `CIVITAI_LORA_PRESETS_JSON`에 JSON으로 등록하면 돼."
     )
     await ctx.send(msg)
@@ -5019,7 +5124,7 @@ async def help_command(ctx):
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
 `.점메추` - 오늘 점심 뭐 먹을지 추천해줌
 `.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
-`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (자연어 자동 프롬프트 변환)
+`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (프롬프트만 입력하면 기본값으로 바로 생성)
 `.이미지프리셋` - 등록된 모델/LoRA 이름 프리셋 보기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.인성진단 [@유저명]` - 채팅 패턴으로 인성 분석 (개재밌음)

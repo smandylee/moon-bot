@@ -11,6 +11,10 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: VERTEX_MODEL
+        sync: false
+      - key: GCP_KEY_JSON
+        sync: false
       - key: GOOGLE_SEARCH_ENGINE_ID
         sync: false
       - key: WARGAMING_API_KEY
