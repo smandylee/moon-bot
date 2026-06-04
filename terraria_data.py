@@ -52,24 +52,32 @@ BOSS_ALIASES = {
 
 
 CLASS_DISPLAY_NAMES = {
-    "melee": "근접",
-    "ranged": "원거리",
-    "mage": "마법",
-    "summoner": "소환",
-    "rogue": "도적",
+    "melee": "워리어",
+    "ranged": "레인저",
+    "mage": "소서러",
+    "summoner": "서머너",
+    "rogue": "로그",
 }
 
 
 CLASS_ALIASES = {
     "근접": "melee",
     "전사": "melee",
+    "워리어": "melee",
+    "warrior": "melee",
     "melee": "melee",
     "원거리": "ranged",
     "레인저": "ranged",
+    "헌터": "ranged",
+    "ranger": "ranged",
     "ranged": "ranged",
     "마법": "mage",
     "메이지": "mage",
+    "소서러": "mage",
+    "위저드": "mage",
     "mage": "mage",
+    "sorcerer": "mage",
+    "wizard": "mage",
     "소환": "summoner",
     "서머너": "summoner",
     "summoner": "summoner",

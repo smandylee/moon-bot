@@ -3305,7 +3305,7 @@ async def terraria_loadout(ctx, *, query: str = None):
     if not class_key:
         await ctx.send(
             "❌ 직업을 인식하지 못했어요.\n"
-            "지원 직업: 근접(melee), 원거리(ranged), 마법(mage), 소환(summoner), 도적(rogue)"
+            "지원 직업: 워리어(warrior), 레인저(ranger), 로그(rogue), 소서러(sorcerer), 서머너(summoner)"
         )
         return
 
