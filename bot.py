@@ -16,8 +16,22 @@ import time
 import shlex
 import aiohttp
 import traceback
+import difflib
 from urllib.parse import urlparse
 from types import SimpleNamespace
+from terraria_data import (
+    BOSS_ALIASES,
+    BOSS_DISPLAY_NAMES,
+    CLASS_ALIASES,
+    CLASS_DISPLAY_NAMES,
+    MATERIAL_ALIASES,
+    MATERIAL_GUIDES,
+    POST_BOSS_LOADOUTS,
+    TERRARIA_SOURCE_URLS,
+    build_terraria_grounded_prompt,
+    build_terraria_material_prompt,
+    localize_terraria_item_text,
+)
 
 # Gemini (Vertex AI, VERTEX_MODEL 공통) 설정
 try:
@@ -3204,6 +3218,180 @@ async def lunch_recommendation(ctx):
     # 간단하게 메뉴만 출력
     await ctx.send(selected_menu)
 
+
+def _normalize_terraria_key(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _format_terraria_items(items):
+    if not items:
+        return "준비중 (데이터 추가 예정)"
+    return "\n".join(f"• {localize_terraria_item_text(item)}" for item in items)
+
+
+@bot.command(name='테라리아')
+async def terraria_loadout(ctx, *, query: str = None):
+    """칼라미티 기준 장비 추천/재료 정보 명령어"""
+    if not query:
+        await ctx.send(
+            "❌ 사용법:\n"
+            "1) `.테라리아 [보스이름] [직업]` (장비 추천)\n"
+            "2) `.테라리아 [재료이름]` (조합/획득처)\n"
+            "예시: `.테라리아 슬라임갓 도적` / `.테라리아 율리블룸오어`"
+        )
+        return
+
+    parts = query.strip().split()
+    normalized_query = _normalize_terraria_key(query)
+
+    # 마지막 토큰이 직업이면 보스+직업 모드, 아니면 재료 모드로 처리
+    is_boss_class_mode = bool(parts) and _normalize_terraria_key(parts[-1]) in CLASS_ALIASES
+
+    if not is_boss_class_mode:
+        material_key = MATERIAL_ALIASES.get(normalized_query)
+        if not material_key and len(parts) == 1:
+            material_key = MATERIAL_ALIASES.get(_normalize_terraria_key(parts[0]))
+
+        material = MATERIAL_GUIDES.get(material_key, {}) if material_key else {}
+        name = material.get("name", query.strip())
+        recipe = material.get("recipe", "정보 준비중")
+        how_to_get = material.get("how_to_get", "정보 준비중")
+        tips = material.get("tips", "정보 준비중")
+
+        ai_note = ""
+        if gemini_model is not None:
+            try:
+                material_prompt = build_terraria_material_prompt(query.strip(), material if material else None)
+                material_ai_response = await asyncio.to_thread(gemini_model.generate_content, material_prompt)
+                ai_text = (getattr(material_ai_response, "text", "") or "").strip()
+                if ai_text:
+                    ai_note = ai_text[:1000] if len(ai_text) > 1000 else ai_text
+            except Exception as material_ai_error:
+                print(f"테라리아 재료 Gemini 조회 실패: {material_ai_error}")
+
+        embed = discord.Embed(
+            title="🧪 Terraria 재료 정보",
+            description=f"**재료:** {name}",
+            color=0x3498DB
+        )
+        embed.add_field(name="조합/제작", value=recipe, inline=False)
+        embed.add_field(name="획득 방법", value=how_to_get, inline=False)
+        embed.add_field(name="진행 팁", value=tips, inline=False)
+        if ai_note:
+            embed.add_field(name="Gemini 3.5 Flash 보강", value=ai_note, inline=False)
+        embed.add_field(
+            name="출처",
+            value="\n".join(f"• {url}" for url in TERRARIA_SOURCE_URLS),
+            inline=False
+        )
+        embed.set_footer(text="기준: Calamity/Terraria Wiki + Gemini 보강")
+        await ctx.send(embed=embed)
+        return
+
+    if len(parts) < 2:
+        await ctx.send(
+            "❌ 입력을 인식하지 못했어요.\n"
+            "장비 추천: `.테라리아 [보스이름] [직업]`\n"
+            "재료 정보: `.테라리아 [재료이름]`\n"
+            "예시: `.테라리아 moon lord summoner` / `.테라리아 auric bar`"
+        )
+        return
+
+    class_input = _normalize_terraria_key(parts[-1])
+    boss_input_raw = " ".join(parts[:-1])
+    boss_input = _normalize_terraria_key(boss_input_raw)
+
+    class_key = CLASS_ALIASES.get(class_input)
+    if not class_key:
+        await ctx.send(
+            "❌ 직업을 인식하지 못했어요.\n"
+            "지원 직업: 근접(melee), 원거리(ranged), 마법(mage), 소환(summoner), 도적(rogue)"
+        )
+        return
+
+    boss_key = BOSS_ALIASES.get(boss_input)
+    if not boss_key:
+        alias_candidates = difflib.get_close_matches(
+            boss_input, list(BOSS_ALIASES.keys()), n=3, cutoff=0.45
+        )
+        display_candidates = []
+        for alias in alias_candidates:
+            mapped_key = BOSS_ALIASES.get(alias)
+            if not mapped_key:
+                continue
+            name = BOSS_DISPLAY_NAMES.get(mapped_key, mapped_key)
+            if name not in display_candidates:
+                display_candidates.append(name)
+
+        if display_candidates:
+            await ctx.send(
+                "❌ 보스 이름을 인식하지 못했어요.\n"
+                f"혹시 이 보스인가요? {', '.join(display_candidates)}\n"
+                "예시: `.테라리아 desert scourge melee`"
+            )
+        else:
+            await ctx.send(
+                "❌ 보스 이름을 인식하지 못했어요.\n"
+                "예시: `.테라리아 slime god rogue` 또는 `.테라리아 문로드 소환`"
+            )
+        return
+
+    boss_payload = POST_BOSS_LOADOUTS.get(boss_key, {})
+    class_data = boss_payload.get(class_key, {})
+    source_meta = boss_payload.get("__meta__", {})
+    weapons = class_data.get("weapons", [])
+    armor = class_data.get("armor", [])
+    accessories = class_data.get("accessories", [])
+    next_goal = class_data.get("next_goal", "준비중 (데이터 추가 예정)")
+
+    boss_display = BOSS_DISPLAY_NAMES.get(boss_key, boss_input_raw)
+    class_display = CLASS_DISPLAY_NAMES.get(class_key, class_key)
+
+    embed = discord.Embed(
+        title="🛠️ Terraria (Calamity) 장비 추천",
+        description=f"**처치 보스:** {boss_display}\n**직업:** {class_display}",
+        color=0x2ECC71
+    )
+    embed.add_field(name="추천 무기", value=_format_terraria_items(weapons), inline=False)
+    embed.add_field(name="추천 방어구", value=_format_terraria_items(armor), inline=False)
+    embed.add_field(name="추천 악세사리", value=_format_terraria_items(accessories), inline=False)
+    embed.add_field(name="다음 파밍 목표", value=next_goal, inline=False)
+    if source_meta:
+        stage = source_meta.get("stage", "미지정")
+        note = source_meta.get("source_note", "")
+        source_context = f"• 단계: {stage}"
+        if note:
+            source_context += f"\n• 기준: {note}"
+        embed.add_field(name="출처 컨텍스트", value=source_context, inline=False)
+    embed.add_field(
+        name="출처",
+        value="\n".join(f"• {url}" for url in TERRARIA_SOURCE_URLS),
+        inline=False
+    )
+    embed.set_footer(text="기준: Calamity 진행 단계(버전별 세부 효율은 달라질 수 있음)")
+
+    if gemini_model is not None:
+        try:
+            grounded_prompt = build_terraria_grounded_prompt(
+                boss_key=boss_key,
+                class_key=class_key,
+                boss_display=boss_display,
+                class_display=class_display,
+                base_loadout=class_data,
+                source_note=source_meta.get("source_note", ""),
+                source_stage=source_meta.get("stage", ""),
+            )
+            ai_response = await asyncio.to_thread(gemini_model.generate_content, grounded_prompt)
+            ai_text = (getattr(ai_response, "text", "") or "").strip()
+            if ai_text:
+                if len(ai_text) > 1000:
+                    ai_text = ai_text[:997] + "..."
+                embed.add_field(name="Gemini 3.5 Flash 검수", value=ai_text, inline=False)
+        except Exception as ai_error:
+            print(f"테라리아 Gemini 검수 실패: {ai_error}")
+
+    await ctx.send(embed=embed)
+
 @bot.command(name='워쉽전적')
 async def wows_stats(ctx, region: str = 'na', *, player_name: str = None):
     """World of Warships 플레이어 전적을 검색하는 명령어
@@ -5130,6 +5318,12 @@ async def help_command(ctx):
 `.인성진단 [@유저명]` - 채팅 패턴으로 인성 분석 (개재밌음)
 `.부검 [검색어]` - 키워드 또는 상황으로 메시지 검색 (개유용함)
 `.포켓몬위치 [포켓몬명/도감번호]` - 포켓몬 스칼렛/바이올렛 위치 정보 (개유용함)
+`.테라리아 [보스명] [직업]` - 칼라미티 기준 보스 처치 후 직업별 추천 장비
+`.테라리아 [재료명]` - 재료 조합법/획득처 안내
+  예시1: `.테라리아 슬라임갓 도적`
+  예시2: `.테라리아 plantera mage`
+  예시3: `.테라리아 아우리크바`
+  예시4: `.테라리아 necroplasm` (미등록 재료는 Gemini 보강)
 `.대화모드 on/off` - 특정 유저 스타일로 대화 모드 (개신기함)
 `.터미널명령어 on/off` - 터미널에서 메시지를 채팅창으로 전송하는 모드
 `.@유저명 [분]동안 닥쳐` - [시간(분)]만큼 닥쳐
