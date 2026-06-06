@@ -1,3 +1,7 @@
+# =============================================================================
+# Moon Bot — main entry point
+# =============================================================================
+
 import discord
 from discord.ext import commands
 import random
@@ -13,7 +17,6 @@ import asyncio
 import threading
 import queue
 import time
-import shlex
 import aiohttp
 import traceback
 import difflib
@@ -407,7 +410,121 @@ def get_speech_style_instruction(user_id: int) -> str:
     """유저별 존댓말 예외 규칙 비활성화"""
     return ""
 
-# Wargaming API 설정
+# =============================================================================
+# WoWS API 설정 및 공통 헬퍼
+# =============================================================================
+STEAM_API_KEY = os.getenv('STEAM_API_KEY', 'your_steam_api_key_here')
+STEAM_ALERT_CHANNEL_ID = int(os.getenv('STEAM_ALERT_CHANNEL_ID', '0') or 0)
+STEAM_POLL_INTERVAL_SECONDS = max(15, int(os.getenv('STEAM_POLL_INTERVAL_SECONDS', '300') or 300))
+STEAM_WATCH_STEAM_IDS = [
+    steam_id.strip()
+    for steam_id in os.getenv('STEAM_WATCH_STEAM_IDS', '').split(',')
+    if steam_id.strip()
+]
+
+steam_previous_game_state = {}
+steam_watch_initialized = False
+steam_watch_task = None
+
+
+def _steam_api_key_ok() -> bool:
+    return STEAM_API_KEY and STEAM_API_KEY != 'your_steam_api_key_here'
+
+
+def _steam_monitor_enabled() -> bool:
+    return _steam_api_key_ok() and STEAM_ALERT_CHANNEL_ID > 0 and bool(STEAM_WATCH_STEAM_IDS)
+
+
+async def _fetch_steam_player_summaries(session):
+    """Steam Web API에서 감시 대상 유저 요약 정보를 가져온다."""
+    url = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/"
+    params = {
+        "key": STEAM_API_KEY,
+        "steamids": ",".join(STEAM_WATCH_STEAM_IDS),
+    }
+    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Steam API 응답 오류: HTTP {response.status}")
+        payload = await response.json(content_type=None)
+        return payload.get("response", {}).get("players", [])
+
+
+def _extract_steam_vanity_or_id(profile_input: str):
+    text = profile_input.strip()
+    if text.isdigit() and len(text) == 17:
+        return text, None
+
+    if text.startswith("http://") or text.startswith("https://"):
+        parsed = urlparse(text)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "profiles" and parts[1].isdigit():
+            return parts[1], None
+        if len(parts) >= 2 and parts[0] == "id":
+            return None, parts[1]
+
+    return None, text
+
+
+async def steam_game_watch_loop():
+    """Steam 게임 실행 감시 루프 (시작/게임 변경 시 디스코드 알림)."""
+    global steam_watch_initialized, steam_previous_game_state
+
+    await bot.wait_until_ready()
+
+    if not _steam_monitor_enabled():
+        print("ℹ️ Steam 감시 비활성화: STEAM_API_KEY / STEAM_ALERT_CHANNEL_ID / STEAM_WATCH_STEAM_IDS 확인 필요")
+        return
+
+    print(f"🎮 Steam 감시 시작: {len(STEAM_WATCH_STEAM_IDS)}명, {STEAM_POLL_INTERVAL_SECONDS}초 주기")
+
+    while not bot.is_closed():
+        try:
+            channel = bot.get_channel(STEAM_ALERT_CHANNEL_ID)
+            if channel is None:
+                channel = await bot.fetch_channel(STEAM_ALERT_CHANNEL_ID)
+
+            async with aiohttp.ClientSession() as session:
+                players = await _fetch_steam_player_summaries(session)
+
+            latest_state = {}
+            for player in players:
+                steam_id = str(player.get("steamid", ""))
+                if not steam_id:
+                    continue
+                latest_state[steam_id] = player.get("gameid")
+
+            # 첫 순회에서는 기준 상태만 저장하고 알림은 보내지 않는다.
+            if not steam_watch_initialized:
+                steam_previous_game_state = latest_state
+                steam_watch_initialized = True
+                await asyncio.sleep(STEAM_POLL_INTERVAL_SECONDS)
+                continue
+
+            for player in players:
+                steam_id = str(player.get("steamid", ""))
+                if not steam_id:
+                    continue
+
+                previous_game_id = steam_previous_game_state.get(steam_id)
+                current_game_id = player.get("gameid")
+                current_game_name = player.get("gameextrainfo", "알 수 없는 게임")
+
+                # "게임을 켰을 때"만 알림: 미실행->실행 또는 게임 변경
+                if current_game_id and current_game_id != previous_game_id:
+                    persona_name = player.get("personaname", steam_id)
+                    profile_url = f"https://steamcommunity.com/profiles/{steam_id}"
+                    await channel.send(
+                        f"🎮 **{persona_name}** 님이 **{current_game_name}** 실행함\n{profile_url}"
+                    )
+
+            steam_previous_game_state = latest_state
+
+        except Exception as steam_error:
+            print(f"❌ Steam 감시 오류: {steam_error}")
+
+        await asyncio.sleep(STEAM_POLL_INTERVAL_SECONDS)
+
+
 WARGAMING_API_KEY = os.getenv('WARGAMING_API_KEY', 'your_wargaming_api_key_here')
 WOWS_API_REGIONS = {
     'na': 'https://api.worldofwarships.com',
@@ -416,6 +533,39 @@ WOWS_API_REGIONS = {
     'ru': 'https://api.worldofwarships.ru'
 }
 WOWS_API_BASE_URL = WOWS_API_REGIONS['na']  # 기본값: NA 서버
+
+_WOWS_REGION_NAMES = {'na': 'NA (북미)', 'eu': 'EU (유럽)', 'asia': 'ASIA (아시아)', 'ru': 'RU (러시아)'}
+
+def _wows_parse_args(region_arg: str, player_name_arg):
+    """리전/플레이어명 인자를 파싱해서 (region_lower, api_base_url, region_display, player_name) 반환.
+    첫 번째 인자가 리전이 아니면 player_name으로 간주하고 region은 'na'로 설정."""
+    region_lower = region_arg.lower()
+    if region_lower not in WOWS_API_REGIONS:
+        player_name_arg = region_arg if player_name_arg is None else f"{region_arg} {player_name_arg}"
+        region_lower = 'na'
+    return (
+        region_lower,
+        WOWS_API_REGIONS[region_lower],
+        _WOWS_REGION_NAMES.get(region_lower, region_lower.upper()),
+        player_name_arg,
+    )
+
+def _wows_api_key_ok() -> bool:
+    return WARGAMING_API_KEY != 'your_wargaming_api_key_here'
+
+async def _wows_find_player(session, api_base_url: str, player_name: str):
+    """Wargaming /account/list/ 로 플레이어를 검색해서 (account_id, nickname)를 반환.
+    찾지 못하면 None 반환."""
+    search_url = f"{api_base_url}/wows/account/list/"
+    params = {'application_id': WARGAMING_API_KEY, 'search': player_name, 'type': 'startswith'}
+    async with session.get(search_url, params=params) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
+        if data.get('status') != 'ok' or not data.get('data'):
+            return None
+        entry = data['data'][0]
+        return entry['account_id'], entry['nickname']
 
 # 봇 설정
 intents = discord.Intents.default()
@@ -642,14 +792,20 @@ async def process_terminal_messages():
         # 잠시 대기
         await asyncio.sleep(0.1)
 
+# =============================================================================
+# 봇 이벤트
+# =============================================================================
 @bot.event
 async def on_ready():
     """봇이 준비되었을 때 실행되는 이벤트"""
+    global steam_watch_task
     print(f"🎯 {bot.user}가 로그인했습니다!")
     print(f"📡 {len(bot.guilds)}개 서버에 연결됨")
     
     # 터미널 메시지 처리 태스크 시작
     bot.loop.create_task(process_terminal_messages())
+    if steam_watch_task is None or steam_watch_task.done():
+        steam_watch_task = bot.loop.create_task(steam_game_watch_loop())
 
 # 가챠운세 제한 유저 관리
 gacha_fortune_cooldowns = {}  # 유저별 쿨다운 시간 저장
@@ -729,622 +885,10 @@ async def send_image_embed(channel, image_url, title="이미지", description=""
         await channel.send(f"📷 **{title}**\n{description}\n{image_url}")
 
 
-def _extract_image_urls(data):
-    """Civitai 응답에서 이미지 URL 목록을 재귀적으로 추출"""
-    urls = []
 
-    def walk(value):
-        if value is None:
-            return
-
-        if isinstance(value, str):
-            if value.startswith("http://") or value.startswith("https://"):
-                parsed = urlparse(value)
-                path = (parsed.path or "").lower()
-                # Civitai 결과 URL은 확장자가 없거나 쿼리스트링 기반일 수 있어 완화 처리
-                if (
-                    path.endswith((".png", ".jpg", ".jpeg", ".webp"))
-                    or "blob" in path
-                    or "image" in path
-                    or "s3" in (parsed.netloc or "").lower()
-                    or "cloudfront" in (parsed.netloc or "").lower()
-                ):
-                    urls.append(value)
-            return
-
-        if isinstance(value, dict):
-            for key in ("url", "imageUrl", "image_url", "blobUrl", "blob_url", "src", "href"):
-                if key in value:
-                    walk(value[key])
-            for v in value.values():
-                walk(v)
-            return
-
-        if isinstance(value, list):
-            for item in value:
-                walk(item)
-            return
-
-        if hasattr(value, "__dict__"):
-            walk(vars(value))
-
-    walk(data)
-    return list(dict.fromkeys(urls))
-
-
-def _load_named_presets():
-    """환경변수 기반 모델/LoRA 이름 프리셋 로드"""
-    model_presets = {}
-    lora_presets = {}
-
-    raw_model_json = os.getenv("CIVITAI_MODEL_PRESETS_JSON", "").strip()
-    raw_lora_json = os.getenv("CIVITAI_LORA_PRESETS_JSON", "").strip()
-
-    if raw_model_json:
-        try:
-            parsed = json.loads(raw_model_json)
-            if isinstance(parsed, dict):
-                for k, v in parsed.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        model_presets[k] = v
-        except Exception as e:
-            print(f"모델 프리셋 JSON 파싱 실패: {e}")
-
-    if raw_lora_json:
-        try:
-            parsed = json.loads(raw_lora_json)
-            if isinstance(parsed, dict):
-                for k, v in parsed.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        lora_presets[k] = v
-        except Exception as e:
-            print(f"LoRA 프리셋 JSON 파싱 실패: {e}")
-
-    return model_presets, lora_presets
-
-
-def _resolve_name_or_urn(value: str, presets: dict, kind: str):
-    """URN 직접 입력 또는 이름 프리셋을 URN으로 변환"""
-    if not value:
-        return None, f"{kind} 값이 비어 있어."
-
-    candidate = value.strip()
-    if candidate.startswith("urn:"):
-        return candidate, None
-
-    lower_map = {k.lower(): v for k, v in presets.items()}
-    resolved = lower_map.get(candidate.lower())
-    if resolved:
-        return resolved, None
-
-    available = ", ".join(presets.keys()) if presets else "(없음)"
-    return None, f"{kind} 프리셋 '{candidate}'을(를) 찾지 못했어. 사용 가능: {available}"
-
-
-def _extract_inline_model_from_prompt(prompt_text: str, model_presets: dict):
-    """프롬프트 본문에서 인라인 모델 지정 추출 (예: '실사 고양이', '실사: 고양이')"""
-    if not prompt_text:
-        return None, prompt_text
-    if not model_presets:
-        return None, prompt_text
-
-    text = prompt_text.strip()
-    if not text:
-        return None, prompt_text
-
-    presets_lower = {k.lower(): k for k in model_presets.keys()}
-
-    # 1) "모델명: 프롬프트"
-    if ":" in text:
-        maybe_model, rest = text.split(":", 1)
-        model_key = presets_lower.get(maybe_model.strip().lower())
-        if model_key and rest.strip():
-            return model_key, rest.strip()
-
-    # 2) "모델명 프롬프트" (첫 토큰이 프리셋 이름일 때)
-    parts = text.split(maxsplit=1)
-    if parts:
-        model_key = presets_lower.get(parts[0].strip().lower())
-        if model_key:
-            remaining = parts[1].strip() if len(parts) > 1 else ""
-            return model_key, remaining
-
-    return None, prompt_text
-
-
-def _parse_civitai_command_args(raw: str):
-    """
-    .이미지생성 옵션 파서
-    지원:
-    - --model <이름 또는 URN>
-    - --lora <이름 또는 URN[:strength]> (여러 번 사용 가능)
-    - --size <WIDTHxHEIGHT> (예: 768x1024)
-    - --steps <int>
-    - --cfg <float>
-    - --no-default-lora
-    - --raw (자연어 프롬프트 자동 변환 비활성화)
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
-
-    try:
-        tokens = shlex.split(raw)
-    except Exception:
-        # 따옴표가 깨진 입력도 최대한 살려서 자연어 우선으로 처리
-        tokens = raw.split()
-        if not tokens:
-            return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
-
-    model = None
-    loras = []  # [{"urn": str, "strength": float}]
-    width = None
-    height = None
-    steps = None
-    cfg_scale = None
-    use_default_lora = True
-    raw_mode = False
-    prompt_tokens = []
-
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t == "--model":
-            if i + 1 >= len(tokens):
-                return None, "--model 뒤에 모델 이름 또는 URN이 필요해."
-            model = tokens[i + 1]
-            i += 2
-            continue
-        if t == "--lora":
-            if i + 1 >= len(tokens):
-                return None, "--lora 뒤에 LoRA 이름/URN 또는 이름/URN:강도가 필요해."
-            value = tokens[i + 1]
-            if ":" in value:
-                urn, s = value.rsplit(":", 1)
-                try:
-                    strength = float(s)
-                except Exception:
-                    return None, f"LoRA 강도 파싱 실패: {value}"
-            else:
-                urn = value
-                strength = 0.8
-            strength = max(0.0, min(strength, 2.0))
-            loras.append({"urn": urn, "strength": strength})
-            i += 2
-            continue
-        if t == "--size":
-            if i + 1 >= len(tokens):
-                return None, "--size 뒤에 768x1024 형식이 필요해."
-            size = tokens[i + 1].lower()
-            if "x" not in size:
-                return None, "--size는 768x1024 형식으로 입력해줘."
-            w, h = size.split("x", 1)
-            try:
-                width = int(w)
-                height = int(h)
-            except Exception:
-                return None, "--size 숫자 파싱 실패."
-            if not (1 <= width <= 1024 and 1 <= height <= 1024):
-                return None, "--size 범위 오류: 가로/세로는 각각 1~1024 사이여야 해."
-            i += 2
-            continue
-        if t == "--steps":
-            if i + 1 >= len(tokens):
-                return None, "--steps 뒤에 숫자가 필요해."
-            try:
-                steps = int(tokens[i + 1])
-            except Exception:
-                return None, "--steps 숫자 파싱 실패."
-            if not (1 <= steps <= 50):
-                return None, "--steps 범위 오류: 1~50 사이로 입력해줘."
-            i += 2
-            continue
-        if t == "--cfg":
-            if i + 1 >= len(tokens):
-                return None, "--cfg 뒤에 숫자가 필요해."
-            try:
-                cfg_scale = float(tokens[i + 1])
-            except Exception:
-                return None, "--cfg 숫자 파싱 실패."
-            if not (1.0 <= cfg_scale <= 20.0):
-                return None, "--cfg 범위 오류: 1.0~20.0 사이로 입력해줘."
-            i += 2
-            continue
-        if t == "--no-default-lora":
-            use_default_lora = False
-            i += 1
-            continue
-        if t == "--raw":
-            raw_mode = True
-            i += 1
-            continue
-
-        prompt_tokens.append(t)
-        i += 1
-
-    prompt = " ".join(prompt_tokens).strip()
-    if len(prompt) >= 2 and (
-        (prompt.startswith('"') and prompt.endswith('"'))
-        or (prompt.startswith("'") and prompt.endswith("'"))
-    ):
-        prompt = prompt[1:-1].strip()
-    if not prompt:
-        return None, "프롬프트가 비어 있어. 텍스트를 같이 넣어줘."
-
-    return {
-        "prompt": prompt,
-        "model": model,
-        "loras": loras,
-        "width": width,
-        "height": height,
-        "steps": steps,
-        "cfg_scale": cfg_scale,
-        "use_default_lora": use_default_lora,
-        "raw_mode": raw_mode,
-    }, None
-
-
-async def _build_civitai_prompt(user_prompt: str) -> str:
-    """자연어 입력을 Civitai용 영문 프롬프트로 정리"""
-    if not user_prompt:
-        return user_prompt
-
-    # AI 사용 불가 시 원문 사용
-    if gemini_model is None:
-        return user_prompt
-
-    instruction = f"""
-다음 사용자 입력을 이미지 생성용 프롬프트로 변환해.
-
-규칙:
-- 영어로만 출력
-- 쉼표로 구분된 키워드 스타일
-- 불필요한 설명 금지, 프롬프트 본문만 출력
-- 과도하게 길지 않게 1줄로 출력
-
-사용자 입력:
-{user_prompt}
-"""
-
-    try:
-        response = await asyncio.to_thread(gemini_model.generate_content, instruction)
-        converted = (response.text or "").strip().replace("\n", ", ")
-        return converted if converted else user_prompt
-    except Exception as e:
-        print(f"프롬프트 변환 실패(원문 사용): {e}")
-        return user_prompt
-
-
-@bot.command(name='이미지생성')
-async def civitai_generate_image(ctx, *, prompt: str = None):
-    """Civitai 이미지 생성 명령어"""
-    if not prompt:
-        await ctx.send(
-            "사용법(자연어 우선): `.이미지생성 [프롬프트]`\n"
-            "옵션(필요할 때만): `--model 이름/URN`, `--lora 이름/URN[:강도]`(반복 가능), `--size 768x1024`, `--steps 24`, `--cfg 7`, `--no-default-lora`, `--raw`\n"
-            "빠른 예시: `.이미지생성 cinematic portrait`\n"
-            "모델+자연어 예시: `.이미지생성 실사 cinematic portrait`\n"
-            "고급 예시: `.이미지생성 cinematic portrait --model 실사 --lora 얼굴보정:0.9 --size 768x1024`\n"
-            "프리셋 목록: `.이미지프리셋`"
-        )
-        return
-
-    civitai_token = (os.getenv("CIVITAI_API_TOKEN") or "").strip()
-    # Railway 변수에 따옴표로 감싸 넣은 실수를 최대한 흡수
-    if (civitai_token.startswith('"') and civitai_token.endswith('"')) or (
-        civitai_token.startswith("'") and civitai_token.endswith("'")
-    ):
-        civitai_token = civitai_token[1:-1].strip()
-    if not civitai_token:
-        await ctx.send("❌ `CIVITAI_API_TOKEN`이 설정되지 않았어. Railway 변수에 추가해줘.")
-        return
-
-    parsed, parse_error = _parse_civitai_command_args(prompt)
-    if parse_error:
-        await ctx.send(f"❌ {parse_error}")
-        return
-
-    model_presets, lora_presets = _load_named_presets()
-
-    default_model_urn = os.getenv("CIVITAI_MODEL_URN", "urn:air:sd1:checkpoint:civitai:4201@130072")
-    default_lora_urn = os.getenv("CIVITAI_DEFAULT_LORA_URN", "urn:air:sd1:lora:civitai:162141@182559")
-    try:
-        default_width = int(os.getenv("CIVITAI_DEFAULT_WIDTH", "768"))
-    except Exception:
-        default_width = 768
-    try:
-        default_height = int(os.getenv("CIVITAI_DEFAULT_HEIGHT", "1024"))
-    except Exception:
-        default_height = 1024
-    try:
-        default_steps = int(os.getenv("CIVITAI_DEFAULT_STEPS", "24"))
-    except Exception:
-        default_steps = 24
-    try:
-        default_cfg_scale = float(os.getenv("CIVITAI_DEFAULT_CFG_SCALE", "7.0"))
-    except Exception:
-        default_cfg_scale = 7.0
-
-    default_width = max(1, min(default_width, 1024))
-    default_height = max(1, min(default_height, 1024))
-    default_steps = max(1, min(default_steps, 50))
-    default_cfg_scale = max(1.0, min(default_cfg_scale, 20.0))
-
-    try:
-        default_lora_strength = float(os.getenv("CIVITAI_DEFAULT_LORA_STRENGTH", "0.8"))
-    except Exception:
-        default_lora_strength = 0.8
-    default_lora_strength = max(0.0, min(default_lora_strength, 2.0))
-
-    # --model 없이도 "실사 고양이" / "실사: 고양이" 형태를 지원
-    if not parsed["model"]:
-        inline_model, inline_prompt = _extract_inline_model_from_prompt(parsed["prompt"], model_presets)
-        if inline_model:
-            parsed["model"] = inline_model
-            parsed["prompt"] = inline_prompt
-
-    model_input = parsed["model"] or default_model_urn
-    model_urn, model_error = _resolve_name_or_urn(model_input, model_presets, "모델")
-    if model_error:
-        await ctx.send(f"❌ {model_error}")
-        return
-
-    if not parsed["prompt"].strip():
-        await ctx.send("❌ 프롬프트가 비어 있어. 모델명 뒤에 생성할 내용을 같이 입력해줘.")
-        return
-
-    effective_width = parsed["width"] if parsed["width"] is not None else default_width
-    effective_height = parsed["height"] if parsed["height"] is not None else default_height
-    effective_steps = parsed["steps"] if parsed["steps"] is not None else default_steps
-    effective_cfg_scale = parsed["cfg_scale"] if parsed["cfg_scale"] is not None else default_cfg_scale
-
-    final_prompt = parsed["prompt"]
-    natural_only_input = "--" not in (prompt or "")
-    if natural_only_input:
-        loading_msg = await ctx.reply("🎨 자연어 입력 확인 완료. 기본 설정으로 생성 준비 중...")
-    else:
-        loading_msg = await ctx.reply("🎨 이미지 생성 요청 준비 중...")
-
-    if not parsed["raw_mode"]:
-        await loading_msg.edit(content="🎨 프롬프트 정리 중...")
-        final_prompt = await _build_civitai_prompt(parsed["prompt"])
-
-    size_text = f"{effective_width}x{effective_height}"
-    await loading_msg.edit(
-        content=(
-            f"🎨 Civitai에 이미지 생성 요청 중... "
-            f"(model: {model_urn.split(':')[-1]}, size: {size_text}, steps: {effective_steps})"
-        )
-    )
-
-    try:
-        debug_context = {
-            "model": model_urn,
-            "raw_mode": parsed["raw_mode"],
-            "use_default_lora": parsed["use_default_lora"],
-            "loras": [l["urn"] for l in parsed["loras"]],
-            "size": f"{effective_width}x{effective_height}",
-            "steps": effective_steps,
-            "cfg": effective_cfg_scale,
-            "token_len": len(civitai_token),
-            "token_suffix": civitai_token[-4:] if len(civitai_token) >= 4 else "(short)",
-        }
-
-        payload = {
-            "model": model_urn,
-            "params": {
-                "prompt": final_prompt,
-                "negativePrompt": "low quality, blurry, deformed, extra fingers, bad anatomy",
-                "scheduler": "EulerA",
-                "steps": effective_steps,
-                "cfgScale": effective_cfg_scale,
-                "width": effective_width,
-                "height": effective_height,
-                "clipSkip": 2
-            }
-        }
-
-        additional_networks = {}
-        if parsed["use_default_lora"] and default_lora_urn:
-            resolved_default_lora, default_lora_error = _resolve_name_or_urn(default_lora_urn, lora_presets, "기본 LoRA")
-            if default_lora_error:
-                raise ValueError(default_lora_error)
-            additional_networks[resolved_default_lora] = {
-                "type": "Lora",
-                "strength": default_lora_strength
-            }
-
-        for lora in parsed["loras"]:
-            resolved_lora_urn, lora_error = _resolve_name_or_urn(lora["urn"], lora_presets, "LoRA")
-            if lora_error:
-                raise ValueError(lora_error)
-            additional_networks[resolved_lora_urn] = {
-                "type": "Lora",
-                "strength": lora["strength"]
-            }
-
-        if additional_networks:
-            payload["additionalNetworks"] = additional_networks
-
-        def _create_job():
-            os.environ["CIVITAI_API_TOKEN"] = civitai_token
-            import civitai
-            civitai_client = civitai.Civitai()
-            return civitai_client.image.create(payload)
-
-        async def _create_job_via_rest():
-            base_model = "SDXL" if "sdxl" in model_urn.lower() else "SD_1_5"
-            job_input = {
-                "$type": "textToImage",
-                "baseModel": base_model,
-                **payload,
-            }
-            url = "https://orchestration.civitai.com/v1/consumer/jobs"
-            headers = {
-                "Authorization": f"Bearer {civitai_token}",
-                "Content-Type": "application/json",
-            }
-            timeout = aiohttp.ClientTimeout(total=40)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=job_input, params={"wait": "false"}) as resp:
-                    raw_text = await resp.text()
-                    parsed_body = None
-                    try:
-                        parsed_body = json.loads(raw_text) if raw_text else {}
-                    except Exception:
-                        parsed_body = {"raw": raw_text}
-
-                    if resp.status >= 400:
-                        cf_ray = resp.headers.get("cf-ray")
-                        server_name = resp.headers.get("server")
-                        body_excerpt = (raw_text or "")[:2000]
-                        raise RuntimeError(
-                            f"REST create failed (HTTP {resp.status})"
-                            f" cf-ray={cf_ray} server={server_name} body={body_excerpt}"
-                        )
-                    return parsed_body
-
-        try:
-            job_response = await asyncio.to_thread(_create_job)
-        except Exception as sdk_create_error:
-            print(f"SDK 생성 실패, REST fallback 시도: {sdk_create_error}")
-            job_response = await _create_job_via_rest()
-
-        image_urls = _extract_image_urls(job_response)
-        if image_urls:
-            await loading_msg.edit(content="✅ 이미지 생성 완료!")
-            await send_image_embed(
-                ctx.channel,
-                image_urls[0],
-                title="🎨 Civitai 생성 이미지",
-                description=f"프롬프트: {final_prompt[:180]}"
-            )
-            return
-
-        token = None
-        job_id = None
-        if isinstance(job_response, dict):
-            token = job_response.get("token")
-            job_id = job_response.get("id") or job_response.get("jobId")
-        else:
-            token = getattr(job_response, "token", None)
-            job_id = getattr(job_response, "id", None) or getattr(job_response, "jobId", None)
-
-        if not token and not job_id:
-            await loading_msg.edit(content="❌ Civitai 응답에서 작업 식별자(token/id)를 찾지 못했어.")
-            return
-
-        await loading_msg.edit(content="⏳ 이미지 생성 중... (최대 2분 대기)")
-
-        def _get_job_status(token_value, job_id_value):
-            os.environ["CIVITAI_API_TOKEN"] = civitai_token
-            import civitai
-            civitai_client = civitai.Civitai()
-            if token_value:
-                return civitai_client.jobs.get(token=token_value)
-            return civitai_client.jobs.get(job_id=job_id_value)
-
-        final_urls = []
-        for _ in range(60):
-            await asyncio.sleep(2)
-            status = await asyncio.to_thread(_get_job_status, token, job_id)
-            final_urls = _extract_image_urls(status)
-            if final_urls:
-                break
-
-        if not final_urls:
-            await loading_msg.edit(content="⚠️ 생성 요청은 접수됐지만 아직 결과 이미지가 준비되지 않았어. 잠시 후 다시 시도해줘.")
-            return
-
-        await loading_msg.edit(content="✅ 이미지 생성 완료!")
-        await send_image_embed(
-            ctx.channel,
-            final_urls[0],
-            title="🎨 Civitai 생성 이미지",
-            description=f"프롬프트: {final_prompt[:180]}"
-        )
-    except Exception as e:
-        # Civitai/HTTP 오류 상세 추출
-        status_code = getattr(e, "status_code", None)
-        error_body = ""
-
-        # civitai.api_config.HTTPException는 args[0]에 상태코드가 들어올 수 있음
-        if status_code is None and getattr(e, "args", None):
-            try:
-                first_arg = e.args[0]
-                if isinstance(first_arg, int):
-                    status_code = first_arg
-                elif isinstance(first_arg, str):
-                    match = re.search(r"\b(\d{3})\b", first_arg)
-                    if match:
-                        status_code = int(match.group(1))
-            except Exception:
-                pass
-
-        if hasattr(e, "response") and getattr(e, "response", None) is not None:
-            try:
-                status_code = getattr(e.response, "status_code", None)
-                error_body = getattr(e.response, "text", "") or ""
-            except Exception:
-                pass
-
-        try:
-            # 일부 예외는 args에 JSON/문자열을 포함
-            if not error_body and getattr(e, "args", None):
-                error_body = " | ".join([str(a) for a in e.args if a is not None])
-        except Exception:
-            pass
-
-        user_error = f"❌ 이미지 생성 오류: {str(e)[:250]}"
-        if status_code == 403:
-            lowered_body = (error_body or "").lower()
-            if "insufficient buzz" in lowered_body:
-                user_error = (
-                    "❌ Civitai 생성 실패: API 사용 가능 Buzz가 부족해.\n"
-                    "- 계정에 Yellow(금색) Buzz/사용 가능한 Buzz 충전\n"
-                    "- 동일 계정으로 발급한 API 키인지 확인 후 재시도"
-                )
-            else:
-                user_error = (
-                    "❌ Civitai 인증/권한 오류(HTTP 403)\n"
-                    "- `CIVITAI_API_TOKEN` 값을 다시 발급 후 재설정\n"
-                    "- Railway 재배포(프로세스 재시작) 후 재시도\n"
-                    "- 계정 크레딧/생성 권한/모델 접근 권한 확인"
-                )
-        elif status_code:
-            user_error += f" (HTTP {status_code})"
-        await loading_msg.edit(content=user_error)
-
-        print("==== Civitai 이미지 생성 상세 오류 ====")
-        print(f"기본 오류: {e}")
-        print(f"HTTP 상태코드: {status_code}")
-        print(f"사용 컨텍스트: {json.dumps(debug_context, ensure_ascii=False)}")
-        if error_body:
-            print(f"에러 바디/상세: {error_body[:2000]}")
-        print(traceback.format_exc())
-        print("====================================")
-
-
-@bot.command(name='이미지프리셋')
-async def civitai_presets(ctx):
-    """등록된 Civitai 모델/LoRA 이름 프리셋 출력"""
-    model_presets, lora_presets = _load_named_presets()
-
-    model_lines = [f"- {name}" for name in model_presets.keys()] if model_presets else ["- (없음)"]
-    lora_lines = [f"- {name}" for name in lora_presets.keys()] if lora_presets else ["- (없음)"]
-
-    msg = (
-        "🧩 **Civitai 프리셋 목록**\n\n"
-        "**모델 이름**\n" + "\n".join(model_lines[:30]) + "\n\n"
-        "**LoRA 이름**\n" + "\n".join(lora_lines[:30]) + "\n\n"
-        "사용 예시:\n"
-        "`.이미지생성 cinematic portrait`\n"
-        "`.이미지생성 실사 cinematic portrait`\n"
-        "`.이미지생성 cinematic portrait --model 실사 --lora 얼굴보정:0.8`\n"
-        "프리셋은 환경변수 `CIVITAI_MODEL_PRESETS_JSON`, `CIVITAI_LORA_PRESETS_JSON`에 JSON으로 등록하면 돼."
-    )
-    await ctx.send(msg)
-
+# =============================================================================
+# 일반 명령어
+# =============================================================================
 @bot.command(name='랜덤')
 async def random_message(ctx):
     """랜덤 메시지를 출력하는 명령어"""
@@ -1564,25 +1108,52 @@ async def skynet(ctx):
     except Exception as e:
         await ctx.send(f"❌ 스카이넷 실행 중 오류 발생: {str(e)}")
 
+async def _stream_ai_reply(reply_target, chat_session, prompt: str, max_len: int = 1500) -> str:
+    """AI 스트리밍 응답을 reply_target(Message)에 실시간으로 편집해서 전송.
+    최종 응답 텍스트를 반환. 실패 시 None 반환."""
+    reply_msg = await reply_target.reply("...")
+    ai_response = ""
+    last_update = ""
+    update_interval = 0.5
+    last_update_time = time.time()
+    try:
+        response = chat_session.send_message(prompt, stream=True)
+        for chunk in response:
+            if chunk.text:
+                ai_response += chunk.text
+                cur = time.time()
+                if cur - last_update_time >= update_interval and ai_response != last_update:
+                    display = ai_response[:max_len] if len(ai_response) > max_len else ai_response
+                    try:
+                        await reply_msg.edit(content=display)
+                        last_update = ai_response
+                        last_update_time = cur
+                    except Exception:
+                        pass
+        ai_response = ai_response.strip()
+        if len(ai_response) > max_len:
+            ai_response = ai_response[:max_len] + "..."
+        await reply_msg.edit(content=ai_response if ai_response else "...")
+    except Exception as stream_err:
+        # 스트리밍 실패 시 일반 응답으로 폴백
+        try:
+            response = chat_session.send_message(prompt)
+            ai_response = response.text.strip()
+            if len(ai_response) > max_len:
+                ai_response = ai_response[:max_len] + "..."
+            await reply_msg.edit(content=ai_response)
+        except Exception:
+            await reply_msg.edit(content="어... 뭔가 오류났는데 다시 말해봐")
+            return None
+    return ai_response
+
+
 @bot.event
 async def on_message(message):
     """모든 메시지를 감지하는 이벤트"""
-    print(f"🔍 메시지 수신: {message.author.name} - {message.content[:30]}...")
-    
-    # 봇 자신의 메시지는 무시
     if message.author == bot.user:
-        print("🤖 봇 자신의 메시지 무시")
         return
-    
-    # DM 채널에서 온 메시지 감지 (답장)
-    if isinstance(message.channel, discord.DMChannel):
-        print(f"\n📩 ========== DM 수신 ==========")
-        print(f"👤 보낸 사람: {message.author.name} ({message.author.display_name})")
-        print(f"💬 내용: {message.content}")
-        print(f"⏰ 시간: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"================================\n")
-    
-    # 명령어로 시작하는 메시지는 명령어 시스템이 처리하도록
+
     if message.content.startswith('.'):
         await bot.process_commands(message)
         return
@@ -1605,71 +1176,23 @@ async def on_message(message):
             # 채널별 대화 세션 관리
             if channel_id not in chat_sessions:
                 chat_sessions[channel_id] = persona_model.start_chat(history=[])
-            
-            # 대화 세션이 너무 길어지면 리셋 (토큰 절약)
             if len(chat_sessions[channel_id].history) > 20:
                 chat_sessions[channel_id] = persona_model.start_chat(history=[])
-            
-            # 기억 컨텍스트 추가
+
             memory_context = get_memory_context(message.author.id)
-            # 존댓말 지시 추가
             speech_style = get_speech_style_instruction(message.author.id)
-            message_with_context = f"{speech_style}{memory_context}[{message.author.display_name}의 메시지]: {user_message}"
-            
-            # 스트리밍 응답 - 먼저 빈 메시지 보내기
-            reply_msg = await message.reply("...")
-            
-            # 스트리밍으로 AI 응답 생성
-            ai_response = ""
-            last_update = ""
-            update_interval = 0.5  # 0.5초마다 업데이트
-            last_update_time = time.time()
-            
-            try:
-                response = chat_sessions[channel_id].send_message(message_with_context, stream=True)
-                
-                for chunk in response:
-                    if chunk.text:
-                        ai_response += chunk.text
-                        
-                        # 일정 시간마다 메시지 업데이트 (rate limit 방지)
-                        current_time = time.time()
-                        if current_time - last_update_time >= update_interval and ai_response != last_update:
-                            display_text = ai_response[:1500] if len(ai_response) > 1500 else ai_response
-                            try:
-                                await reply_msg.edit(content=display_text)
-                                last_update = ai_response
-                                last_update_time = current_time
-                            except:
-                                pass
-                
-                # 최종 응답 업데이트
-                ai_response = ai_response.strip()
-                if len(ai_response) > 1500:
-                    ai_response = ai_response[:1500] + "..."
-                
-                await reply_msg.edit(content=ai_response if ai_response else "...")
-                
-            except Exception as stream_error:
-                print(f"스트리밍 오류: {stream_error}")
-                # 스트리밍 실패시 일반 응답으로 폴백
-                response = chat_sessions[channel_id].send_message(message_with_context)
-                ai_response = response.text.strip()
-                if len(ai_response) > 1500:
-                    ai_response = ai_response[:1500] + "..."
-                await reply_msg.edit(content=ai_response)
-            
-            # 대화 버퍼에 저장 (자동 요약용)
-            add_to_conversation_buffer(message.author.id, message.author.display_name, 'user', user_message)
-            add_to_conversation_buffer(message.author.id, message.author.display_name, 'bot', ai_response)
-            
-            # 대화가 일정 수 이상 쌓이면 자동 요약
-            user_id_str = str(message.author.id)
-            if user_id_str in conversation_buffer:
-                msg_count = len(conversation_buffer[user_id_str].get('messages', []))
-                if msg_count >= SUMMARY_THRESHOLD:
-                    await summarize_and_save_conversation(message.author.id, message.author.display_name)
-                
+            prompt = f"{speech_style}{memory_context}[{message.author.display_name}의 메시지]: {user_message}"
+
+            ai_response = await _stream_ai_reply(message, chat_sessions[channel_id], prompt)
+
+            if ai_response:
+                add_to_conversation_buffer(message.author.id, message.author.display_name, 'user', user_message)
+                add_to_conversation_buffer(message.author.id, message.author.display_name, 'bot', ai_response)
+                user_id_str = str(message.author.id)
+                if user_id_str in conversation_buffer:
+                    if len(conversation_buffer[user_id_str].get('messages', [])) >= SUMMARY_THRESHOLD:
+                        await summarize_and_save_conversation(message.author.id, message.author.display_name)
+
         except Exception as e:
             print(f"AI 응답 오류: {e}")
             await message.reply("어... 뭔가 오류났는데 다시 말해봐")
@@ -1850,19 +1373,11 @@ async def on_message(message):
     if "민제" in message.content:
         await message.channel.send("박민제 시발 권문얼굴같은련")
     # 뮤트 기능 - "@유저명 5분동안 닥쳐" 패턴 감지
-    import re
-    
-    # 두 가지 패턴 지원: 맨션 방식과 유저명 직접 입력 방식
-    mute_pattern1 = r'<@!?(\d+)>\s*(\d+)분동안\s*닥쳐'  # 맨션 방식
-    mute_pattern2 = r'@(\S+)\s+(\d+)분동안\s*닥쳐'      # 유저명 직접 입력 방식
-    
+    mute_pattern1 = r'<@!?(\d+)>\s*(\d+)분동안\s*닥쳐'
+    mute_pattern2 = r'@(\S+)\s+(\d+)분동안\s*닥쳐'
+
     mute_match1 = re.match(mute_pattern1, message.content)
     mute_match2 = re.match(mute_pattern2, message.content)
-    
-    # 디버깅: 메시지 내용 출력
-    print(f"받은 메시지: {message.content}")
-    print(f"패턴1 매치: {mute_match1}")
-    print(f"패턴2 매치: {mute_match2}")
     
     if mute_match1 or mute_match2:
         try:
@@ -2060,8 +1575,6 @@ async def message_search(ctx, *, search_query):
                     response = gemini_model.generate_content(prompt)
                     ai_result = response.text.strip()
                     
-                    # AI 결과에서 번호 추출
-                    import re
                     numbers = re.findall(r'\d+', ai_result)
                     
                     # 해당 번호의 메시지들을 결과에 추가
@@ -3218,7 +2731,6 @@ async def lunch_recommendation(ctx):
     # 간단하게 메뉴만 출력
     await ctx.send(selected_menu)
 
-
 def _normalize_terraria_key(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
@@ -3392,6 +2904,9 @@ async def terraria_loadout(ctx, *, query: str = None):
 
     await ctx.send(embed=embed)
 
+# =============================================================================
+# WoWS 명령어
+# =============================================================================
 @bot.command(name='워쉽전적')
 async def wows_stats(ctx, region: str = 'na', *, player_name: str = None):
     """World of Warships 플레이어 전적을 검색하는 명령어
@@ -3404,75 +2919,27 @@ async def wows_stats(ctx, region: str = 'na', *, player_name: str = None):
     .워쉽전적 ru 플레이어명       (RU 서버)
     """
     try:
-        # 리전과 플레이어명 파싱
-        region_lower = region.lower()
-        
-        # 리전이 지정되지 않은 경우 (첫 번째 인자가 플레이어명)
-        if region_lower not in WOWS_API_REGIONS and player_name is None:
-            player_name = region
-            region_lower = 'na'  # 기본값
-        
-        # 플레이어명이 없으면 오류
+        region_lower, api_base_url, region_name, player_name = _wows_parse_args(region, player_name)
+
         if not player_name:
             await ctx.send("❌ 사용법: `.워쉽전적 [리전] 플레이어명`\n예시: `.워쉽전적 na Flamu` 또는 `.워쉽전적 Flamu`\n\n지원 리전: na, eu, asia, ru")
             return
-        
-        # 리전별 API URL 선택
-        if region_lower not in WOWS_API_REGIONS:
-            await ctx.send(f"❌ 올바른 리전을 입력하세요: na, eu, asia, ru\n입력한 리전: {region_lower}")
-            return
-        
-        api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {
-            'na': 'NA (북미)',
-            'eu': 'EU (유럽)', 
-            'asia': 'ASIA (아시아)',
-            'ru': 'RU (러시아)'
-        }
-        region_name = region_names.get(region_lower, region_lower.upper())
-        
-        # 로딩 메시지 전송
+
         loading_msg = await ctx.send(f"🔍 '{player_name}' 플레이어 검색 중... ({region_name} 서버)")
-        
-        # API 키 확인
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!\n.env 파일에 WARGAMING_API_KEY를 추가해주세요.\nhttps://developers.wargaming.net/ 에서 발급받을 수 있습니다.")
             return
-        
+
         async with aiohttp.ClientSession() as session:
-            # 1단계: 플레이어 검색 (여러 타입으로 시도)
-            search_url = f"{api_base_url}/wows/account/list/"
-            
-            # 먼저 startswith로 시도 (더 넓은 검색)
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
-            
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content=f"❌ API 요청 실패! Wargaming API 키를 확인해주세요.")
-                    return
-                
-                search_data = await response.json()
-                
-                # 응답 상태 확인
-                if search_data.get('status') != 'ok':
-                    error_msg = search_data.get('error', {}).get('message', '알 수 없는 오류')
-                    await loading_msg.edit(content=f"❌ API 오류: {error_msg}")
-                    return
-                
-                # 검색 결과 확인
-                if not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.\n\n💡 팁:\n- 플레이어 이름을 정확히 입력했는지 확인하세요\n- 대소문자는 상관없습니다\n- 일부 이름만 입력해도 검색됩니다")
-                    return
-                
-                # 첫 번째 검색 결과 사용
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
-                
-                await loading_msg.edit(content=f"🔍 '{found_nickname}' 플레이어 정보 로딩 중...")
+            # 1단계: 플레이어 검색
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.\n\n💡 팁:\n- 플레이어 이름을 정확히 입력했는지 확인하세요\n- 대소문자는 상관없습니다\n- 일부 이름만 입력해도 검색됩니다")
+                return
+            account_id, found_nickname = result
+
+            await loading_msg.edit(content=f"🔍 '{found_nickname}' 플레이어 정보 로딩 중...")
             
             # 2단계: 플레이어 통계 가져오기
             stats_url = f"{api_base_url}/wows/account/info/"
@@ -3700,82 +3167,59 @@ async def wows_stats(ctx, region: str = 'na', *, player_name: str = None):
 async def wows_actor_stats(ctx, region: str = 'na', *, player_name: str = None):
     """플레이어의 판수(전투 수) 통계를 검색하는 명령어"""
     try:
+        region_lower, api_base_url, region_name, player_name = _wows_parse_args(region, player_name)
+
         if not player_name:
-            if region.lower() in WOWS_API_REGIONS:
-                await ctx.send("❌ 사용법: `.워쉽액터 [리전] 플레이어명`")
-            else:
-                player_name = region
-                region = 'na'
-            if not player_name:
-                return
-        
-        region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
-        api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
-        region_name = region_names.get(region_lower, 'NA')
-        
+            await ctx.send("❌ 사용법: `.워쉽액터 [리전] 플레이어명`")
+            return
+
         loading_msg = await ctx.send(f"🔍 '{player_name}'의 판수 통계 검색 중... ({region_name} 서버)")
-        
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
-        
+
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
+                
+            # 플레이어 전적 가져오기
+            stats_url = f"{api_base_url}/wows/account/info/"
+            stats_params = {
                 'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
+                'account_id': account_id
             }
-            
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+                
+            async with session.get(stats_url, params=stats_params) as stats_response:
+                stats_data = await stats_response.json()
+                if stats_data.get('status') != 'ok' or not stats_data.get('data'):
+                    await loading_msg.edit(content="❌ 전적 정보를 가져올 수 없습니다.")
                     return
-                
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
-                    return
-                
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
-                
-                # 플레이어 전적 가져오기
-                stats_url = f"{api_base_url}/wows/account/info/"
-                stats_params = {
-                    'application_id': WARGAMING_API_KEY,
-                    'account_id': account_id
-                }
-                
-                async with session.get(stats_url, params=stats_params) as stats_response:
-                    stats_data = await stats_response.json()
-                    if stats_data.get('status') != 'ok' or not stats_data.get('data'):
-                        await loading_msg.edit(content="❌ 전적 정보를 가져올 수 없습니다.")
-                        return
                     
-                    player_data = stats_data['data'][str(account_id)]
-                    pvp_stats = player_data.get('statistics', {}).get('pvp', {})
+                player_data = stats_data['data'][str(account_id)]
+                pvp_stats = player_data.get('statistics', {}).get('pvp', {})
                     
-                    battles = pvp_stats.get('battles', 0)
+                battles = pvp_stats.get('battles', 0)
                     
-                    # Embed 생성
-                    embed = discord.Embed(
-                        title=f"📊 {found_nickname}의 판수 통계",
-                        description=f"**{region_name} 서버**",
-                        color=0x3498DB
-                    )
+                # Embed 생성
+                embed = discord.Embed(
+                    title=f"📊 {found_nickname}의 판수 통계",
+                    description=f"**{region_name} 서버**",
+                    color=0x3498DB
+                )
                     
-                    # 총 판수
-                    embed.add_field(
-                        name="🎯 액터 고용한 판수",
-                        value=f"```\n{battles:,}전```",
-                        inline=False
-                    )
+                # 총 판수
+                embed.add_field(
+                    name="🎯 액터 고용한 판수",
+                    value=f"```\n{battles:,}전```",
+                    inline=False
+                )
                     
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
         
     except Exception as e:
         await ctx.send(f"❌ 액터 통계 검색 중 오류: {str(e)}")
@@ -3791,60 +3235,27 @@ async def wows_ship_stats(ctx, region: str = 'na', *, player_name: str = None):
     .워쉽함선 asia 플레이어명     (ASIA 서버)
     """
     try:
-        # 리전과 플레이어명 파싱
-        region_lower = region.lower()
-        
-        if region_lower not in WOWS_API_REGIONS and player_name is None:
-            player_name = region
-            region_lower = 'na'
-        
+        region_lower, api_base_url, region_name, player_name = _wows_parse_args(region, player_name)
+
         if not player_name:
             await ctx.send("❌ 사용법: `.워쉽함선 [리전] 플레이어명`\n예시: `.워쉽함선 Flamu`")
             return
-        
-        if region_lower not in WOWS_API_REGIONS:
-            await ctx.send(f"❌ 올바른 리전을 입력하세요: na, eu, asia, ru")
-            return
-        
-        api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {
-            'na': 'NA (북미)',
-            'eu': 'EU (유럽)', 
-            'asia': 'ASIA (아시아)',
-            'ru': 'RU (러시아)'
-        }
-        region_name = region_names.get(region_lower, region_lower.upper())
-        
+
         loading_msg = await ctx.send(f"🔍 '{player_name}' 플레이어의 함선 전적 검색 중... ({region_name} 서버)")
-        
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
-        
+
         async with aiohttp.ClientSession() as session:
             # 1단계: 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
-            
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content=f"❌ API 요청 실패!")
-                    return
-                
-                search_data = await response.json()
-                
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
-                    return
-                
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
-                
-                await loading_msg.edit(content=f"🔍 '{found_nickname}'의 함선 데이터 로딩 중...")
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
+
+            await loading_msg.edit(content=f"🔍 '{found_nickname}'의 함선 데이터 로딩 중...")
             
             # 2단계: 함선별 통계 가져오기
             ships_url = f"{api_base_url}/wows/ships/stats/"
@@ -4048,27 +3459,15 @@ async def wows_ship_stats(ctx, region: str = 'na', *, player_name: str = None):
 async def wows_clan(ctx, region: str = 'na', *, clan_tag: str = None):
     """클랜 정보를 검색하는 명령어"""
     try:
+        region_lower, api_base_url, region_name, clan_tag = _wows_parse_args(region, clan_tag)
+
         if not clan_tag:
-            if region.lower() in WOWS_API_REGIONS:
-                await ctx.send("❌ 사용법: `.워쉽클랜 [리전] [클랜태그]`\n예시: `.워쉽클랜 na CLAN`")
-            else:
-                clan_tag = region
-                region = 'na'
-            if not clan_tag:
-                await ctx.send("❌ 사용법: `.워쉽클랜 [리전] [클랜태그]`")
-                return
-        
-        region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
-        if region_lower not in WOWS_API_REGIONS:
-            region_lower = 'na'
-        
-        api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA (북미)', 'eu': 'EU (유럽)', 'asia': 'ASIA (아시아)', 'ru': 'RU (러시아)'}
-        region_name = region_names.get(region_lower, 'NA')
-        
+            await ctx.send("❌ 사용법: `.워쉽클랜 [리전] [클랜태그]`\n예시: `.워쉽클랜 na CLAN`")
+            return
+
         loading_msg = await ctx.send(f"🔍 클랜 '{clan_tag}' 검색 중... ({region_name} 서버)")
-        
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
@@ -4177,7 +3576,7 @@ async def wows_ship_info(ctx, *, ship_name: str):
             await ctx.send("❌ 검색어에 대괄호 `[]`를 포함할 수 없습니다. 대괄호 없이 함선 이름만 입력하세요.\n예시: `.워쉽함선정보 Montana`")
             return
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await ctx.send("❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
@@ -4481,203 +3880,149 @@ async def wows_ship_info(ctx, *, ship_name: str):
 async def wows_compare(ctx, region: str = 'na', *, players: str = None):
     """두 플레이어를 비교하는 명령어"""
     try:
-        # 리전과 플레이어명 파싱
         region_lower = region.lower()
-        
-        # 리전이 지정되지 않은 경우 (첫 번째 인자가 플레이어명)
         if region_lower not in WOWS_API_REGIONS:
             if players is None:
-                # 첫 번째 인자가 플레이어명이고, 두 번째 인자가 없음
                 await ctx.send("❌ 사용법: `.워쉽비교 [리전] 플레이어1 플레이어2`\n예시: `.워쉽비교 Player1 Player2` 또는 `.워쉽비교 na Player1 Player2`")
                 return
-            else:
-                # 첫 번째 인자가 플레이어명, players가 두 번째 플레이어명
-                player_list = [region] + players.split()
-                region_lower = 'na'
+            player_list = [region] + players.split()
+            region_lower = 'na'
         else:
-            # 리전이 지정된 경우
             if not players:
                 await ctx.send("❌ 사용법: `.워쉽비교 [리전] 플레이어1 플레이어2`\n예시: `.워쉽비교 Player1 Player2`")
                 return
             player_list = players.split()
-        
+
         if len(player_list) < 2:
             await ctx.send("❌ 두 명의 플레이어 이름을 입력하세요!")
             return
-        
-        player1_name = player_list[0]
-        player2_name = player_list[1]
+
+        player1_name, player2_name = player_list[0], player_list[1]
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
-        region_name = region_names.get(region_lower, 'NA')
-        
+        region_name = _WOWS_REGION_NAMES.get(region_lower, 'NA')
+
         loading_msg = await ctx.send(f"🔍 '{player1_name}' vs '{player2_name}' 비교 중...")
-        
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
-        
+
         async with aiohttp.ClientSession() as session:
-            # 두 플레이어 정보 가져오기
             players_data = []
             for player_name in [player1_name, player2_name]:
-                search_url = f"{api_base_url}/wows/account/list/"
-                search_params = {
-                    'application_id': WARGAMING_API_KEY,
-                    'search': player_name,
-                    'type': 'startswith'
-                }
-                
-                async with session.get(search_url, params=search_params) as response:
-                    if response.status != 200:
-                        await loading_msg.edit(content=f"❌ '{player_name}' 검색 실패!")
+                result = await _wows_find_player(session, api_base_url, player_name)
+                if not result:
+                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                    return
+                account_id, nickname = result
+
+                stats_url = f"{api_base_url}/wows/account/info/"
+                stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                async with session.get(stats_url, params=stats_params) as stats_response:
+                    stats_data = await stats_response.json()
+                    if stats_data.get('status') != 'ok' or not stats_data.get('data'):
+                        await loading_msg.edit(content=f"❌ '{nickname}' 전적 정보를 가져올 수 없습니다.")
                         return
-                    
-                    search_data = await response.json()
-                    if search_data.get('status') != 'ok' or not search_data.get('data'):
-                        await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
-                        return
-                    
-                    account_id = search_data['data'][0]['account_id']
-                    nickname = search_data['data'][0]['nickname']
-                    
-                    # 통계 가져오기
-                    stats_url = f"{api_base_url}/wows/account/info/"
-                    stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
-                    
-                    async with session.get(stats_url, params=stats_params) as stats_response:
-                        stats_data = await stats_response.json()
-                        if stats_data.get('status') == 'ok' and stats_data.get('data'):
-                            player_data = stats_data['data'][str(account_id)]
-                            stats = player_data.get('statistics', {}).get('pvp', {})
-                            
-                            battles = stats.get('battles', 0)
-                            wins = stats.get('wins', 0)
-                            damage = stats.get('damage_dealt', 0)
-                            frags = stats.get('frags', 0)
-                            
-                            win_rate = (wins / battles * 100) if battles > 0 else 0
-                            avg_damage = damage / battles if battles > 0 else 0
-                            avg_frags = frags / battles if battles > 0 else 0
-                            
-                            # PR 계산 (WoWS Numbers 정확한 공식)
-                            pr = 0
-                            if battles > 0:
-                                try:
-                                    # 함선별 통계 가져오기
-                                    ships_url = f"{api_base_url}/wows/ships/stats/"
-                                    ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
-                                    
-                                    async with session.get(ships_url, params=ships_params) as ships_response:
-                                        ships_data = await ships_response.json()
-                                        
-                                        if ships_data.get('status') == 'ok' and ships_data.get('data'):
-                                            player_ships = ships_data['data'].get(str(account_id), [])
-                                            
-                                            if player_ships:
-                                                # 실제 값
-                                                total_actual_damage = damage
-                                                total_actual_wins = wins
-                                                total_actual_frags = frags
-                                                
-                                                # 기댓값 합산
-                                                total_expected_damage = 0
-                                                total_expected_wins = 0
-                                                total_expected_frags = 0
-                                                
-                                                for ship in player_ships:
-                                                    ship_id = ship['ship_id']
-                                                    pvp_stats = ship.get('pvp', {})
-                                                    ship_battles = pvp_stats.get('battles', 0)
-                                                    
-                                                    if ship_battles == 0:
-                                                        continue
-                                                    
-                                                    # Expected values 가져오기
-                                                    expected = PR_EXPECTED_VALUES.get(str(ship_id))
-                                                    if expected and isinstance(expected, dict):
-                                                        exp_damage = expected.get('average_damage_dealt', 0)
-                                                        exp_frags = expected.get('average_frags', 0)
-                                                        exp_wins = expected.get('win_rate', 0) / 100
-                                                        
-                                                        # 기댓값 합산
-                                                        total_expected_damage += exp_damage * ship_battles
-                                                        total_expected_wins += exp_wins * ship_battles
-                                                        total_expected_frags += exp_frags * ship_battles
-                                                
-                                                # PR 계산
-                                                if total_expected_damage > 0 and total_expected_wins > 0 and total_expected_frags > 0:
-                                                    # Step 1: Ratios
-                                                    rDmg = total_actual_damage / total_expected_damage
-                                                    rFrags = total_actual_frags / total_expected_frags
-                                                    rWins = total_actual_wins / total_expected_wins
-                                                    
-                                                    # Step 2: Normalization
-                                                    nDmg = max(0, (rDmg - 0.4) / (1 - 0.4))
-                                                    nFrags = max(0, (rFrags - 0.1) / (1 - 0.1))
-                                                    nWins = max(0, (rWins - 0.7) / (1 - 0.7))
-                                                    
-                                                    # Step 3: PR Value
-                                                    pr = int(700 * nDmg + 300 * nFrags + 150 * nWins)
-                                except Exception as e:
-                                    print(f"비교 PR 계산 오류 ({nickname}): {e}")
-                                    pr = 0
-                            
-                            players_data.append({
-                                'name': nickname,
-                                'battles': battles,
-                                'win_rate': win_rate,
-                                'avg_damage': avg_damage,
-                                'avg_frags': avg_frags,
-                                'pr': pr
-                            })
-            
+
+                player_data = stats_data['data'][str(account_id)]
+                stats = player_data.get('statistics', {}).get('pvp', {})
+                battles = stats.get('battles', 0)
+                wins = stats.get('wins', 0)
+                damage = stats.get('damage_dealt', 0)
+                frags = stats.get('frags', 0)
+                win_rate = (wins / battles * 100) if battles > 0 else 0
+                avg_damage = damage / battles if battles > 0 else 0
+                avg_frags = frags / battles if battles > 0 else 0
+
+                pr = 0
+                if battles > 0:
+                    try:
+                        ships_url = f"{api_base_url}/wows/ships/stats/"
+                        ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                        async with session.get(ships_url, params=ships_params) as ships_response:
+                            ships_data = await ships_response.json()
+
+                        if ships_data.get('status') == 'ok' and ships_data.get('data'):
+                            player_ships = ships_data['data'].get(str(account_id), [])
+                            if player_ships:
+                                total_expected_damage = 0
+                                total_expected_wins = 0
+                                total_expected_frags = 0
+                                for ship in player_ships:
+                                    pvp_stats = ship.get('pvp', {})
+                                    ship_battles = pvp_stats.get('battles', 0)
+                                    if ship_battles == 0:
+                                        continue
+                                    expected = PR_EXPECTED_VALUES.get(str(ship['ship_id']))
+                                    if expected and isinstance(expected, dict):
+                                        total_expected_damage += expected.get('average_damage_dealt', 0) * ship_battles
+                                        total_expected_wins += (expected.get('win_rate', 0) / 100) * ship_battles
+                                        total_expected_frags += expected.get('average_frags', 0) * ship_battles
+
+                                if total_expected_damage > 0 and total_expected_wins > 0 and total_expected_frags > 0:
+                                    r_dmg = damage / total_expected_damage
+                                    r_frags = frags / total_expected_frags
+                                    r_wins = wins / total_expected_wins
+                                    n_dmg = max(0, (r_dmg - 0.4) / 0.6)
+                                    n_frags = max(0, (r_frags - 0.1) / 0.9)
+                                    n_wins = max(0, (r_wins - 0.7) / 0.3)
+                                    pr = int(700 * n_dmg + 300 * n_frags + 150 * n_wins)
+                    except Exception as e:
+                        print(f"비교 PR 계산 오류 ({nickname}): {e}")
+                        pr = 0
+
+                players_data.append({
+                    'name': nickname,
+                    'battles': battles,
+                    'win_rate': win_rate,
+                    'avg_damage': avg_damage,
+                    'avg_frags': avg_frags,
+                    'pr': pr
+                })
+
             if len(players_data) != 2:
                 await loading_msg.edit(content="❌ 두 플레이어 정보를 모두 가져올 수 없습니다.")
                 return
-            
+
             p1, p2 = players_data[0], players_data[1]
-            
-            # 승자 판정
             winner = "무승부"
             if p1['pr'] > p2['pr']:
                 winner = p1['name']
             elif p2['pr'] > p1['pr']:
                 winner = p2['name']
-            
+
             embed = discord.Embed(
                 title=f"⚔️ {p1['name']} vs {p2['name']}",
                 description=f"**{region_name} 서버** • 승자: **{winner}** 🏆",
                 color=0x3498DB
             )
-            
-            # 비교 표시
             embed.add_field(
                 name=f"👤 {p1['name']}",
-                value=f"```\n"
-                      f"PR: {p1['pr']:,}\n"
-                      f"전투: {p1['battles']:,}\n"
-                      f"승률: {p1['win_rate']:.2f}%\n"
-                      f"평균 피해: {p1['avg_damage']:,.0f}\n"
-                      f"평균 격침: {p1['avg_frags']:.2f}\n"
-                      f"```",
+                value=(
+                    f"```\n"
+                    f"PR: {p1['pr']:,}\n"
+                    f"전투: {p1['battles']:,}\n"
+                    f"승률: {p1['win_rate']:.2f}%\n"
+                    f"평균 피해: {p1['avg_damage']:,.0f}\n"
+                    f"평균 격침: {p1['avg_frags']:.2f}\n"
+                    f"```"
+                ),
                 inline=True
             )
-            
             embed.add_field(
                 name=f"👤 {p2['name']}",
-                value=f"```\n"
-                      f"PR: {p2['pr']:,}\n"
-                      f"전투: {p2['battles']:,}\n"
-                      f"승률: {p2['win_rate']:.2f}%\n"
-                      f"평균 피해: {p2['avg_damage']:,.0f}\n"
-                      f"평균 격침: {p2['avg_frags']:.2f}\n"
-                      f"```",
+                value=(
+                    f"```\n"
+                    f"PR: {p2['pr']:,}\n"
+                    f"전투: {p2['battles']:,}\n"
+                    f"승률: {p2['win_rate']:.2f}%\n"
+                    f"평균 피해: {p2['avg_damage']:,.0f}\n"
+                    f"평균 격침: {p2['avg_frags']:.2f}\n"
+                    f"```"
+                ),
                 inline=True
             )
-            
             await loading_msg.edit(content="", embed=embed)
-            
+
     except Exception as e:
         await ctx.send(f"❌ 플레이어 비교 중 오류: {str(e)}")
         print(f"워쉽 비교 오류: {e}")
@@ -4697,79 +4042,64 @@ async def wows_ranked(ctx, region: str = 'na', *, player_name: str = None):
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 랭크전 전적 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
             
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+            # 랭크전 통계
+            stats_url = f"{api_base_url}/wows/account/info/"
+            stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+            
+            async with session.get(stats_url, params=stats_params) as stats_response:
+                stats_data = await stats_response.json()
+                if stats_data.get('status') != 'ok':
+                    await loading_msg.edit(content="❌ 통계 정보를 가져올 수 없습니다.")
                     return
                 
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                player_data = stats_data['data'][str(account_id)]
+                ranked_stats = player_data.get('statistics', {}).get('rank_solo', {})
+                
+                if not ranked_stats or ranked_stats.get('battles', 0) == 0:
+                    await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 랭크전 기록이 없습니다.")
                     return
                 
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
+                battles = ranked_stats.get('battles', 0)
+                wins = ranked_stats.get('wins', 0)
+                damage = ranked_stats.get('damage_dealt', 0)
+                win_rate = (wins / battles * 100) if battles > 0 else 0
+                avg_damage = damage / battles if battles > 0 else 0
                 
-                # 랭크전 통계
-                stats_url = f"{api_base_url}/wows/account/info/"
-                stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                embed = discord.Embed(
+                    title=f"🏆 {found_nickname}의 랭크전 전적",
+                    description=f"**{region_name} 서버**",
+                    color=0xFFD700
+                )
                 
-                async with session.get(stats_url, params=stats_params) as stats_response:
-                    stats_data = await stats_response.json()
-                    if stats_data.get('status') != 'ok':
-                        await loading_msg.edit(content="❌ 통계 정보를 가져올 수 없습니다.")
-                        return
-                    
-                    player_data = stats_data['data'][str(account_id)]
-                    ranked_stats = player_data.get('statistics', {}).get('rank_solo', {})
-                    
-                    if not ranked_stats or ranked_stats.get('battles', 0) == 0:
-                        await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 랭크전 기록이 없습니다.")
-                        return
-                    
-                    battles = ranked_stats.get('battles', 0)
-                    wins = ranked_stats.get('wins', 0)
-                    damage = ranked_stats.get('damage_dealt', 0)
-                    win_rate = (wins / battles * 100) if battles > 0 else 0
-                    avg_damage = damage / battles if battles > 0 else 0
-                    
-                    embed = discord.Embed(
-                        title=f"🏆 {found_nickname}의 랭크전 전적",
-                        description=f"**{region_name} 서버**",
-                        color=0xFFD700
-                    )
-                    
-                    embed.add_field(
-                        name="📊 랭크전 통계",
-                        value=f"```\n"
-                              f"전투: {battles:,}회\n"
-                              f"승리: {wins:,}회\n"
-                              f"승률: {win_rate:.2f}%\n"
-                              f"평균 피해: {avg_damage:,.0f}\n"
-                              f"```",
-                        inline=False
-                    )
-                    
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                embed.add_field(
+                    name="📊 랭크전 통계",
+                    value=f"```\n"
+                          f"전투: {battles:,}회\n"
+                          f"승리: {wins:,}회\n"
+                          f"승률: {win_rate:.2f}%\n"
+                          f"평균 피해: {avg_damage:,.0f}\n"
+                          f"```",
+                    inline=False
+                )
+                
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
                     
     except Exception as e:
         await ctx.send(f"❌ 랭크전 전적 검색 중 오류: {str(e)}")
@@ -4790,83 +4120,68 @@ async def wows_achievements(ctx, region: str = 'na', *, player_name: str = None)
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 업적 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
             
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+            # 업적 정보
+            stats_url = f"{api_base_url}/wows/account/info/"
+            stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+            
+            async with session.get(stats_url, params=stats_params) as stats_response:
+                stats_data = await stats_response.json()
+                if stats_data.get('status') != 'ok':
+                    await loading_msg.edit(content="❌ 통계 정보를 가져올 수 없습니다.")
                     return
                 
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                player_data = stats_data['data'][str(account_id)]
+                achievements = player_data.get('achievements', {})
+                
+                if not achievements:
+                    await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 업적 정보가 없습니다.")
                     return
                 
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
+                # 주요 업적 추출
+                major_achievements = {
+                    'kraken': achievements.get('kraken_unleashed', 0),
+                    'high_caliber': achievements.get('high_caliber', 0),
+                    'confederate': achievements.get('confederate', 0),
+                    'double_strike': achievements.get('double_strike', 0),
+                    'dreadnought': achievements.get('dreadnought', 0),
+                    'first_blood': achievements.get('first_blood', 0)
+                }
                 
-                # 업적 정보
-                stats_url = f"{api_base_url}/wows/account/info/"
-                stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                embed = discord.Embed(
+                    title=f"🏅 {found_nickname}의 업적",
+                    description=f"**{region_name} 서버**",
+                    color=0xFFD700
+                )
                 
-                async with session.get(stats_url, params=stats_params) as stats_response:
-                    stats_data = await stats_response.json()
-                    if stats_data.get('status') != 'ok':
-                        await loading_msg.edit(content="❌ 통계 정보를 가져올 수 없습니다.")
-                        return
-                    
-                    player_data = stats_data['data'][str(account_id)]
-                    achievements = player_data.get('achievements', {})
-                    
-                    if not achievements:
-                        await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 업적 정보가 없습니다.")
-                        return
-                    
-                    # 주요 업적 추출
-                    major_achievements = {
-                        'kraken': achievements.get('kraken_unleashed', 0),
-                        'high_caliber': achievements.get('high_caliber', 0),
-                        'confederate': achievements.get('confederate', 0),
-                        'double_strike': achievements.get('double_strike', 0),
-                        'dreadnought': achievements.get('dreadnought', 0),
-                        'first_blood': achievements.get('first_blood', 0)
-                    }
-                    
-                    embed = discord.Embed(
-                        title=f"🏅 {found_nickname}의 업적",
-                        description=f"**{region_name} 서버**",
-                        color=0xFFD700
-                    )
-                    
-                    achievement_text = f"```\n"
-                    achievement_text += f"Kraken: {major_achievements['kraken']}회\n"
-                    achievement_text += f"High Caliber: {major_achievements['high_caliber']}회\n"
-                    achievement_text += f"Confederate: {major_achievements['confederate']}회\n"
-                    achievement_text += f"Double Strike: {major_achievements['double_strike']}회\n"
-                    achievement_text += f"Dreadnought: {major_achievements['dreadnought']}회\n"
-                    achievement_text += f"First Blood: {major_achievements['first_blood']}회\n"
-                    achievement_text += f"```"
-                    
-                    embed.add_field(name="⭐ 주요 업적", value=achievement_text, inline=False)
-                    
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                achievement_text = f"```\n"
+                achievement_text += f"Kraken: {major_achievements['kraken']}회\n"
+                achievement_text += f"High Caliber: {major_achievements['high_caliber']}회\n"
+                achievement_text += f"Confederate: {major_achievements['confederate']}회\n"
+                achievement_text += f"Double Strike: {major_achievements['double_strike']}회\n"
+                achievement_text += f"Dreadnought: {major_achievements['dreadnought']}회\n"
+                achievement_text += f"First Blood: {major_achievements['first_blood']}회\n"
+                achievement_text += f"```"
+                
+                embed.add_field(name="⭐ 주요 업적", value=achievement_text, inline=False)
+                
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
                     
     except Exception as e:
         await ctx.send(f"❌ 업적 검색 중 오류: {str(e)}")
@@ -4887,12 +4202,12 @@ async def wows_recent_battles(ctx, region: str = 'na', *, player_name: str = Non
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 최근 전투 기록 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
@@ -4910,7 +4225,7 @@ async def wows_ship_ranking(ctx, *, ship_name: str):
     try:
         loading_msg = await ctx.send(f"🔍 함선 '{ship_name}' 순위표 검색 중...")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
@@ -4936,111 +4251,96 @@ async def wows_tier_stats(ctx, region: str = 'na', *, player_name: str = None):
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 티어별 통계 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
             
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+            # 함선별 통계 가져오기
+            ships_url = f"{api_base_url}/wows/ships/stats/"
+            ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+            
+            async with session.get(ships_url, params=ships_params) as ships_response:
+                ships_data = await ships_response.json()
+                if ships_data.get('status') != 'ok' or not ships_data.get('data'):
+                    await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
                     return
                 
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                player_ships = ships_data['data'][str(account_id)]
+                
+                # 티어별 집계
+                tier_stats = {}
+                # 모든 함선의 ID 수집
+                ship_ids = [str(ship['ship_id']) for ship in player_ships]
+                
+                # Encyclopedia에서 티어 정보 가져오기 (100개씩 분할 요청)
+                ship_tiers = {}
+                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
+                
+                # API 제한으로 인해 100개씩 분할
+                for i in range(0, len(ship_ids), 100):
+                    batch_ids = ship_ids[i:i+100]
+                    encyclopedia_params = {
+                        'application_id': WARGAMING_API_KEY,
+                        'ship_id': ','.join(batch_ids),
+                        'fields': 'tier'
+                    }
+                    
+                    try:
+                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
+                            if enc_response.status == 200:
+                                enc_data = await enc_response.json()
+                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
+                                    for sid, ship_info in enc_data['data'].items():
+                                        ship_tiers[int(sid)] = ship_info.get('tier', 0)
+                    except:
+                        pass
+                
+                for ship in player_ships:
+                    pvp = ship.get('pvp', {})
+                    battles = pvp.get('battles', 0)
+                    if battles == 0:
+                        continue
+                    
+                    ship_id = ship['ship_id']
+                    tier = ship_tiers.get(ship_id, 0)
+                    
+                    if tier not in tier_stats:
+                        tier_stats[tier] = {'battles': 0, 'wins': 0}
+                    tier_stats[tier]['battles'] += battles
+                    tier_stats[tier]['wins'] += pvp.get('wins', 0)
+                
+                if not tier_stats:
+                    await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 티어별 통계가 없습니다.")
                     return
                 
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
+                embed = discord.Embed(
+                    title=f"📊 {found_nickname}의 티어별 통계",
+                    description=f"**{region_name} 서버**",
+                    color=0x3498DB
+                )
                 
-                # 함선별 통계 가져오기
-                ships_url = f"{api_base_url}/wows/ships/stats/"
-                ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                tier_text = "```\n"
+                for tier in sorted(tier_stats.keys(), reverse=True):
+                    stats = tier_stats[tier]
+                    win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
+                    tier_text += f"티어 {tier}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
+                tier_text += "```"
                 
-                async with session.get(ships_url, params=ships_params) as ships_response:
-                    ships_data = await ships_response.json()
-                    if ships_data.get('status') != 'ok' or not ships_data.get('data'):
-                        await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
-                        return
-                    
-                    player_ships = ships_data['data'][str(account_id)]
-                    
-                    # 티어별 집계
-                    tier_stats = {}
-                    # 모든 함선의 ID 수집
-                    ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                    
-                    # Encyclopedia에서 티어 정보 가져오기 (100개씩 분할 요청)
-                    ship_tiers = {}
-                    encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                    
-                    # API 제한으로 인해 100개씩 분할
-                    for i in range(0, len(ship_ids), 100):
-                        batch_ids = ship_ids[i:i+100]
-                        encyclopedia_params = {
-                            'application_id': WARGAMING_API_KEY,
-                            'ship_id': ','.join(batch_ids),
-                            'fields': 'tier'
-                        }
-                        
-                        try:
-                            async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                                if enc_response.status == 200:
-                                    enc_data = await enc_response.json()
-                                    if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                        for sid, ship_info in enc_data['data'].items():
-                                            ship_tiers[int(sid)] = ship_info.get('tier', 0)
-                        except:
-                            pass
-                    
-                    for ship in player_ships:
-                        pvp = ship.get('pvp', {})
-                        battles = pvp.get('battles', 0)
-                        if battles == 0:
-                            continue
-                        
-                        ship_id = ship['ship_id']
-                        tier = ship_tiers.get(ship_id, 0)
-                        
-                        if tier not in tier_stats:
-                            tier_stats[tier] = {'battles': 0, 'wins': 0}
-                        tier_stats[tier]['battles'] += battles
-                        tier_stats[tier]['wins'] += pvp.get('wins', 0)
-                    
-                    if not tier_stats:
-                        await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 티어별 통계가 없습니다.")
-                        return
-                    
-                    embed = discord.Embed(
-                        title=f"📊 {found_nickname}의 티어별 통계",
-                        description=f"**{region_name} 서버**",
-                        color=0x3498DB
-                    )
-                    
-                    tier_text = "```\n"
-                    for tier in sorted(tier_stats.keys(), reverse=True):
-                        stats = tier_stats[tier]
-                        win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
-                        tier_text += f"티어 {tier}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
-                    tier_text += "```"
-                    
-                    embed.add_field(name="🎯 티어별 전투", value=tier_text, inline=False)
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                embed.add_field(name="🎯 티어별 전투", value=tier_text, inline=False)
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
                     
     except Exception as e:
         await ctx.send(f"❌ 티어별 통계 검색 중 오류: {str(e)}")
@@ -5061,110 +4361,95 @@ async def wows_nation_stats(ctx, region: str = 'na', *, player_name: str = None)
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 국가별 통계 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
             
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+            # 함선별 통계
+            ships_url = f"{api_base_url}/wows/ships/stats/"
+            ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+            
+            async with session.get(ships_url, params=ships_params) as ships_response:
+                ships_data = await ships_response.json()
+                if ships_data.get('status') != 'ok' or not ships_data.get('data'):
+                    await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
                     return
                 
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                player_ships = ships_data['data'][str(account_id)]
+                
+                # 국가별 집계
+                nation_stats = {}
+                # 모든 함선의 ID 수집
+                ship_ids = [str(ship['ship_id']) for ship in player_ships]
+                
+                # 함선 국가 정보 가져오기 (100개씩 분할 요청)
+                ship_nations = {}
+                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
+                
+                # API 제한으로 인해 100개씩 분할
+                for i in range(0, len(ship_ids), 100):
+                    batch_ids = ship_ids[i:i+100]
+                    encyclopedia_params = {
+                        'application_id': WARGAMING_API_KEY,
+                        'ship_id': ','.join(batch_ids),
+                        'fields': 'nation'
+                    }
+                    
+                    try:
+                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
+                            if enc_response.status == 200:
+                                enc_data = await enc_response.json()
+                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
+                                    for sid, ship_info in enc_data['data'].items():
+                                        ship_nations[int(sid)] = ship_info.get('nation', 'Unknown')
+                    except:
+                        pass
+                
+                for ship in player_ships:
+                    pvp = ship.get('pvp', {})
+                    battles = pvp.get('battles', 0)
+                    if battles == 0:
+                        continue
+                    
+                    ship_id = ship['ship_id']
+                    nation = ship_nations.get(ship_id, 'Unknown')
+                    
+                    if nation not in nation_stats:
+                        nation_stats[nation] = {'battles': 0, 'wins': 0}
+                    nation_stats[nation]['battles'] += battles
+                    nation_stats[nation]['wins'] += pvp.get('wins', 0)
+                
+                if not nation_stats:
+                    await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 국가별 통계가 없습니다.")
                     return
                 
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
+                embed = discord.Embed(
+                    title=f"🌍 {found_nickname}의 국가별 통계",
+                    description=f"**{region_name} 서버**",
+                    color=0x3498DB
+                )
                 
-                # 함선별 통계
-                ships_url = f"{api_base_url}/wows/ships/stats/"
-                ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                nation_text = "```\n"
+                for nation, stats in sorted(nation_stats.items(), key=lambda x: x[1]['battles'], reverse=True):
+                    win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
+                    nation_text += f"{nation}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
+                nation_text += "```"
                 
-                async with session.get(ships_url, params=ships_params) as ships_response:
-                    ships_data = await ships_response.json()
-                    if ships_data.get('status') != 'ok' or not ships_data.get('data'):
-                        await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
-                        return
-                    
-                    player_ships = ships_data['data'][str(account_id)]
-                    
-                    # 국가별 집계
-                    nation_stats = {}
-                    # 모든 함선의 ID 수집
-                    ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                    
-                    # 함선 국가 정보 가져오기 (100개씩 분할 요청)
-                    ship_nations = {}
-                    encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                    
-                    # API 제한으로 인해 100개씩 분할
-                    for i in range(0, len(ship_ids), 100):
-                        batch_ids = ship_ids[i:i+100]
-                        encyclopedia_params = {
-                            'application_id': WARGAMING_API_KEY,
-                            'ship_id': ','.join(batch_ids),
-                            'fields': 'nation'
-                        }
-                        
-                        try:
-                            async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                                if enc_response.status == 200:
-                                    enc_data = await enc_response.json()
-                                    if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                        for sid, ship_info in enc_data['data'].items():
-                                            ship_nations[int(sid)] = ship_info.get('nation', 'Unknown')
-                        except:
-                            pass
-                    
-                    for ship in player_ships:
-                        pvp = ship.get('pvp', {})
-                        battles = pvp.get('battles', 0)
-                        if battles == 0:
-                            continue
-                        
-                        ship_id = ship['ship_id']
-                        nation = ship_nations.get(ship_id, 'Unknown')
-                        
-                        if nation not in nation_stats:
-                            nation_stats[nation] = {'battles': 0, 'wins': 0}
-                        nation_stats[nation]['battles'] += battles
-                        nation_stats[nation]['wins'] += pvp.get('wins', 0)
-                    
-                    if not nation_stats:
-                        await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 국가별 통계가 없습니다.")
-                        return
-                    
-                    embed = discord.Embed(
-                        title=f"🌍 {found_nickname}의 국가별 통계",
-                        description=f"**{region_name} 서버**",
-                        color=0x3498DB
-                    )
-                    
-                    nation_text = "```\n"
-                    for nation, stats in sorted(nation_stats.items(), key=lambda x: x[1]['battles'], reverse=True):
-                        win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
-                        nation_text += f"{nation}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
-                    nation_text += "```"
-                    
-                    embed.add_field(name="🎯 국가별 전투", value=nation_text, inline=False)
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                embed.add_field(name="🎯 국가별 전투", value=nation_text, inline=False)
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
         
     except Exception as e:
         await ctx.send(f"❌ 국가별 통계 검색 중 오류: {str(e)}")
@@ -5185,123 +4470,172 @@ async def wows_type_stats(ctx, region: str = 'na', *, player_name: str = None):
         
         region_lower = region.lower() if region.lower() in WOWS_API_REGIONS else 'na'
         api_base_url = WOWS_API_REGIONS[region_lower]
-        region_names = {'na': 'NA', 'eu': 'EU', 'asia': 'ASIA', 'ru': 'RU'}
+        region_names = _WOWS_REGION_NAMES
         region_name = region_names.get(region_lower, 'NA')
         
         loading_msg = await ctx.send(f"🔍 '{player_name}' 타입별 통계 검색 중... ({region_name} 서버)")
         
-        if WARGAMING_API_KEY == 'your_wargaming_api_key_here':
+        if not _wows_api_key_ok():
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
         async with aiohttp.ClientSession() as session:
-            # 플레이어 검색
-            search_url = f"{api_base_url}/wows/account/list/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'search': player_name,
-                'type': 'startswith'
-            }
+            result = await _wows_find_player(session, api_base_url, player_name)
+            if not result:
+                await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
+                return
+            account_id, found_nickname = result
             
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    await loading_msg.edit(content="❌ API 요청 실패!")
+            # 함선별 통계
+            ships_url = f"{api_base_url}/wows/ships/stats/"
+            ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+            
+            async with session.get(ships_url, params=ships_params) as ships_response:
+                ships_data = await ships_response.json()
+                if ships_data.get('status') != 'ok' or not ships_data.get('data'):
+                    await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
                     return
                 
-                search_data = await response.json()
-                if search_data.get('status') != 'ok' or not search_data.get('data'):
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
-                    return
+                player_ships = ships_data['data'][str(account_id)]
                 
-                account_id = search_data['data'][0]['account_id']
-                found_nickname = search_data['data'][0]['nickname']
+                # 타입별 집계
+                type_stats = {}
+                # 모든 함선의 ID 수집
+                ship_ids = [str(ship['ship_id']) for ship in player_ships]
                 
-                # 함선별 통계
-                ships_url = f"{api_base_url}/wows/ships/stats/"
-                ships_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
+                # 함선 타입 정보 가져오기 (100개씩 분할 요청)
+                ship_types = {}
+                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
                 
-                async with session.get(ships_url, params=ships_params) as ships_response:
-                    ships_data = await ships_response.json()
-                    if ships_data.get('status') != 'ok' or not ships_data.get('data'):
-                        await loading_msg.edit(content="❌ 함선 통계를 가져올 수 없습니다.")
-                        return
-                    
-                    player_ships = ships_data['data'][str(account_id)]
-                    
-                    # 타입별 집계
-                    type_stats = {}
-                    # 모든 함선의 ID 수집
-                    ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                    
-                    # 함선 타입 정보 가져오기 (100개씩 분할 요청)
-                    ship_types = {}
-                    encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                    
-                    # API 제한으로 인해 100개씩 분할
-                    for i in range(0, len(ship_ids), 100):
-                        batch_ids = ship_ids[i:i+100]
-                        encyclopedia_params = {
-                            'application_id': WARGAMING_API_KEY,
-                            'ship_id': ','.join(batch_ids),
-                            'fields': 'type'
-                        }
-                        
-                        try:
-                            async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                                if enc_response.status == 200:
-                                    enc_data = await enc_response.json()
-                                    if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                        for sid, ship_info in enc_data['data'].items():
-                                            ship_types[int(sid)] = ship_info.get('type', 'Unknown')
-                        except:
-                            pass
-                    
-                    for ship in player_ships:
-                        pvp = ship.get('pvp', {})
-                        battles = pvp.get('battles', 0)
-                        if battles == 0:
-                            continue
-                        
-                        ship_id = ship['ship_id']
-                        ship_type = ship_types.get(ship_id, 'Unknown')
-                        
-                        if ship_type not in type_stats:
-                            type_stats[ship_type] = {'battles': 0, 'wins': 0}
-                        type_stats[ship_type]['battles'] += battles
-                        type_stats[ship_type]['wins'] += pvp.get('wins', 0)
-                    
-                    if not type_stats:
-                        await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 타입별 통계가 없습니다.")
-                        return
-                    
-                    embed = discord.Embed(
-                        title=f"🚢 {found_nickname}의 타입별 통계",
-                        description=f"**{region_name} 서버**",
-                        color=0x3498DB
-                    )
-                    
-                    type_names = {
-                        'Destroyer': '🔰 구축함',
-                        'Cruiser': '⚓ 순양함',
-                        'Battleship': '🛡️ 전함',
-                        'AirCarrier': '✈️ 항공모함',
-                        'Submarine': '🔱 잠수함'
+                # API 제한으로 인해 100개씩 분할
+                for i in range(0, len(ship_ids), 100):
+                    batch_ids = ship_ids[i:i+100]
+                    encyclopedia_params = {
+                        'application_id': WARGAMING_API_KEY,
+                        'ship_id': ','.join(batch_ids),
+                        'fields': 'type'
                     }
                     
-                    type_text = "```\n"
-                    for ship_type, stats in sorted(type_stats.items(), key=lambda x: x[1]['battles'], reverse=True):
-                        type_name = type_names.get(ship_type, ship_type)
-                        win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
-                        type_text += f"{type_name}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
-                    type_text += "```"
+                    try:
+                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
+                            if enc_response.status == 200:
+                                enc_data = await enc_response.json()
+                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
+                                    for sid, ship_info in enc_data['data'].items():
+                                        ship_types[int(sid)] = ship_info.get('type', 'Unknown')
+                    except:
+                        pass
+                
+                for ship in player_ships:
+                    pvp = ship.get('pvp', {})
+                    battles = pvp.get('battles', 0)
+                    if battles == 0:
+                        continue
                     
-                    embed.add_field(name="🎯 타입별 전투", value=type_text, inline=False)
-                    embed.set_footer(text=f"Account ID: {account_id}")
-                    await loading_msg.edit(content="", embed=embed)
+                    ship_id = ship['ship_id']
+                    ship_type = ship_types.get(ship_id, 'Unknown')
+                    
+                    if ship_type not in type_stats:
+                        type_stats[ship_type] = {'battles': 0, 'wins': 0}
+                    type_stats[ship_type]['battles'] += battles
+                    type_stats[ship_type]['wins'] += pvp.get('wins', 0)
+                
+                if not type_stats:
+                    await loading_msg.edit(content=f"❌ '{found_nickname}' 플레이어의 타입별 통계가 없습니다.")
+                    return
+                
+                embed = discord.Embed(
+                    title=f"🚢 {found_nickname}의 타입별 통계",
+                    description=f"**{region_name} 서버**",
+                    color=0x3498DB
+                )
+                
+                type_names = {
+                    'Destroyer': '🔰 구축함',
+                    'Cruiser': '⚓ 순양함',
+                    'Battleship': '🛡️ 전함',
+                    'AirCarrier': '✈️ 항공모함',
+                    'Submarine': '🔱 잠수함'
+                }
+                
+                type_text = "```\n"
+                for ship_type, stats in sorted(type_stats.items(), key=lambda x: x[1]['battles'], reverse=True):
+                    type_name = type_names.get(ship_type, ship_type)
+                    win_rate = (stats['wins'] / stats['battles'] * 100) if stats['battles'] > 0 else 0
+                    type_text += f"{type_name}: {stats['battles']:,}전 ({win_rate:.1f}%)\n"
+                type_text += "```"
+                
+                embed.add_field(name="🎯 타입별 전투", value=type_text, inline=False)
+                embed.set_footer(text=f"Account ID: {account_id}")
+                await loading_msg.edit(content="", embed=embed)
                     
     except Exception as e:
         await ctx.send(f"❌ 타입별 통계 검색 중 오류: {str(e)}")
         print(f"워쉽 타입 통계 오류: {e}")
+
+@bot.command(name='스팀아이디')
+async def steam_id_lookup(ctx, *, profile_input: str = None):
+    """Steam 프로필 URL/바니티ID/SteamID64를 받아 SteamID64를 알려주는 명령어"""
+    if not profile_input:
+        await ctx.send(
+            "❌ 사용법: `.스팀아이디 [프로필URL|바니티ID|SteamID64]`\n"
+            "예시: `.스팀아이디 https://steamcommunity.com/id/gaben/`"
+        )
+        return
+
+    steam_id64, vanity = _extract_steam_vanity_or_id(profile_input)
+    if steam_id64:
+        await ctx.send(
+            f"✅ SteamID64: `{steam_id64}`\n"
+            f"프로필: https://steamcommunity.com/profiles/{steam_id64}"
+        )
+        return
+
+    if not _steam_api_key_ok():
+        await ctx.send(
+            "❌ 바니티ID 변환에는 STEAM_API_KEY가 필요합니다.\n"
+            "숫자형 프로필 URL(`.../profiles/7656...`)은 API 없이 바로 확인할 수 있어요."
+        )
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            resolve_url = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/"
+            params = {"key": STEAM_API_KEY, "vanityurl": vanity}
+            async with session.get(resolve_url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    await ctx.send(f"❌ Steam API 요청 실패 (HTTP {response.status})")
+                    return
+                payload = await response.json(content_type=None)
+
+        info = payload.get("response", {})
+        if info.get("success") == 1 and info.get("steamid"):
+            resolved_id = info["steamid"]
+            await ctx.send(
+                f"✅ SteamID64: `{resolved_id}`\n"
+                f"프로필: https://steamcommunity.com/profiles/{resolved_id}"
+            )
+            return
+
+        await ctx.send(
+            "❌ 해당 입력으로 SteamID를 찾지 못했습니다.\n"
+            "프로필 공개 상태인지, URL/아이디 오타가 없는지 확인해주세요."
+        )
+    except Exception as e:
+        await ctx.send(f"❌ SteamID 조회 중 오류: {e}")
+
+
+@bot.command(name='스팀감시상태')
+async def steam_watch_status(ctx):
+    """Steam 감시 설정 상태를 출력한다."""
+    watching_ids = ", ".join(STEAM_WATCH_STEAM_IDS) if STEAM_WATCH_STEAM_IDS else "없음"
+    await ctx.send(
+        "🎮 Steam 감시 설정 상태\n"
+        f"- API 키 설정: {'예' if _steam_api_key_ok() else '아니오'}\n"
+        f"- 알림 채널 ID: `{STEAM_ALERT_CHANNEL_ID}`\n"
+        f"- 감시 대상 SteamID: {watching_ids}\n"
+        f"- 폴링 주기: {STEAM_POLL_INTERVAL_SECONDS}초"
+    )
 
 @bot.command(name='도움말')
 async def help_command(ctx):
@@ -5312,12 +4646,12 @@ async def help_command(ctx):
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
 `.점메추` - 오늘 점심 뭐 먹을지 추천해줌
 `.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
-`.이미지생성 [프롬프트] [옵션]` - Civitai 이미지 생성 (프롬프트만 입력하면 기본값으로 바로 생성)
-`.이미지프리셋` - 등록된 모델/LoRA 이름 프리셋 보기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.인성진단 [@유저명]` - 채팅 패턴으로 인성 분석 (개재밌음)
 `.부검 [검색어]` - 키워드 또는 상황으로 메시지 검색 (개유용함)
 `.포켓몬위치 [포켓몬명/도감번호]` - 포켓몬 스칼렛/바이올렛 위치 정보 (개유용함)
+`.스팀아이디 [프로필URL/바니티ID/SteamID64]` - 감시용 SteamID64 조회
+`.스팀감시상태` - Steam 감시 설정 상태 확인
 `.테라리아 [보스명] [직업]` - 칼라미티 기준 보스 처치 후 직업별 추천 장비
 `.테라리아 [재료명]` - 재료 조합법/획득처 안내
   예시1: `.테라리아 슬라임갓 도적`
