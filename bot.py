@@ -65,8 +65,8 @@ openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
 
 # Vertex AI 초기화 (google-genai SDK, Vertex 모드)
 GCP_PROJECT_ID = "alphavertex-486307"
-GCP_LOCATION = os.getenv("GCP_LOCATION", "global")  # Gemini 3.5 Flash 권장: global
-VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-3.5-flash")  # Vertex/Gemini 모델 ID (전 기능 공통)
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global")  # Gemini 3.7 Flash 권장: global
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-3.7-flash")  # Vertex/Gemini 모델 ID (전 기능 공통)
 
 # 서비스 계정 키 파일 경로 설정
 GCP_KEY_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'gcp-key.json')
@@ -2790,7 +2790,7 @@ async def terraria_loadout(ctx, *, query: str = None):
         embed.add_field(name="획득 방법", value=how_to_get, inline=False)
         embed.add_field(name="진행 팁", value=tips, inline=False)
         if ai_note:
-            embed.add_field(name="Gemini 3.5 Flash 보강", value=ai_note, inline=False)
+            embed.add_field(name="Gemini 3.7 Flash 보강", value=ai_note, inline=False)
         embed.add_field(
             name="출처",
             value="\n".join(f"• {url}" for url in TERRARIA_SOURCE_URLS),
@@ -2898,7 +2898,7 @@ async def terraria_loadout(ctx, *, query: str = None):
             if ai_text:
                 if len(ai_text) > 1000:
                     ai_text = ai_text[:997] + "..."
-                embed.add_field(name="Gemini 3.5 Flash 검수", value=ai_text, inline=False)
+                embed.add_field(name="Gemini 3.7 Flash 검수", value=ai_text, inline=False)
         except Exception as ai_error:
             print(f"테라리아 Gemini 검수 실패: {ai_error}")
 
