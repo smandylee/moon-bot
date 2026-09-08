@@ -14,19 +14,20 @@ from typing import Optional
 import json
 import re
 import asyncio
+import contextlib
 import threading
 import queue
 import time
 import aiohttp
-import traceback
 from urllib.parse import urlparse
-from types import SimpleNamespace
 
 # Gemini (Vertex AI, VERTEX_MODEL 공통) 설정
 try:
     from google import genai
+    from google.genai import types as genai_types
 except Exception:
     genai = None
+    genai_types = None
 
 # PR Expected Values 로드
 try:
@@ -48,6 +49,22 @@ except Exception as e:
 
 # OpenAI API 설정
 openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
+
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+_openai_client = None
+
+
+def get_openai_client():
+    """OpenAI 클라이언트를 한 번만 만들어 재사용 (예전엔 호출마다 새로 생성)."""
+    global _openai_client
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key or api_key == 'your_openai_api_key_here':
+        return None
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
+
 
 # Vertex AI 초기화 (google-genai SDK, Vertex 모드)
 GCP_PROJECT_ID = "alphavertex-486307"
@@ -87,6 +104,10 @@ else:
     else:
         print("⚠️ GCP 서비스 계정 키를 찾을 수 없습니다.")
 
+# 대화 기록으로 되돌려 보낼 최대 항목 수 (user/model 각각 1개씩 = 10턴)
+HISTORY_MAX_ENTRIES = 20
+
+
 class _CompatResponse:
     def __init__(self, text: str):
         self.text = text or ""
@@ -104,7 +125,7 @@ class _CompatChatSession:
 
     def send_message(self, message: str, stream: bool = False):
         if not stream:
-            response = self._model.generate_content(message)
+            response = self._model.generate_content(message, history=self.history)
             self.history.append({"role": "user", "text": message})
             self.history.append({"role": "model", "text": response.text})
             return response
@@ -112,10 +133,8 @@ class _CompatChatSession:
         def _stream_gen():
             full_text = ""
             try:
-                prompt = self._model._build_prompt_with_history(message, self.history)
                 response_stream = self._model._client.models.generate_content_stream(
-                    model=self._model.model_name,
-                    contents=prompt,
+                    **self._model._request_kwargs(message, self.history)
                 )
                 for chunk in response_stream:
                     chunk_text = getattr(chunk, "text", "") or ""
@@ -138,30 +157,43 @@ class GenerativeModel:
         else:
             self.system_instruction = str(system_instruction or "")
 
-    def _build_prompt_with_history(self, prompt: str, history=None) -> str:
-        chunks = []
-        if self.system_instruction:
-            chunks.append(f"[System]\n{self.system_instruction}")
-        if history:
-            hist = history[-20:]
-            lines = []
-            for item in hist:
-                role = item.get("role", "user")
-                text = item.get("text", "")
-                if text:
-                    lines.append(f"{role}: {text}")
-            if lines:
-                chunks.append("[History]\n" + "\n".join(lines))
-        chunks.append(f"[User]\n{prompt}")
-        return "\n\n".join(chunks)
+    def _build_contents(self, prompt: str, history=None):
+        """대화 기록을 role별 contents 리스트로 만든다.
 
-    def generate_content(self, prompt: str):
+        예전에는 전체를 문자열 하나로 뭉쳐서 보냈다. 그러면 role 구분이 사라지고
+        요청마다 접두부가 달라져 프리픽스 캐싱도 걸리지 않는다.
+        """
+        contents = []
+        for item in (history or [])[-HISTORY_MAX_ENTRIES:]:
+            text = item.get("text", "")
+            if not text:
+                continue
+            role = "model" if item.get("role") == "model" else "user"
+            contents.append({"role": role, "parts": [{"text": text}]})
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        return contents
+
+    def _request_kwargs(self, prompt: str, history=None) -> dict:
+        contents = self._build_contents(prompt, history)
+        kwargs = {"model": self.model_name, "contents": contents}
+        if self.system_instruction:
+            if genai_types is not None:
+                kwargs["config"] = genai_types.GenerateContentConfig(
+                    system_instruction=self.system_instruction
+                )
+            else:
+                # types를 못 쓰는 환경에서는 첫 메시지에 붙여서라도 전달한다
+                contents.insert(0, {
+                    "role": "user",
+                    "parts": [{"text": f"[System]\n{self.system_instruction}"}],
+                })
+        return kwargs
+
+    def generate_content(self, prompt: str, history=None):
         if not self._client:
             raise RuntimeError("AI client is not initialized")
-        full_prompt = self._build_prompt_with_history(prompt)
         response = self._client.models.generate_content(
-            model=self.model_name,
-            contents=full_prompt,
+            **self._request_kwargs(prompt, history)
         )
         return _CompatResponse(getattr(response, "text", ""))
 
@@ -170,6 +202,7 @@ class GenerativeModel:
         if history:
             session.history = list(history)
         return session
+
 
 
 genai_client = None
@@ -194,6 +227,100 @@ else:
     else:
         print("⚠️ Vertex AI 비활성화: GCP 인증 정보가 없습니다.")
     gemini_model = None
+
+# =============================================================================
+# 비동기 실행 헬퍼
+# google-genai SDK 호출은 동기라서, 그대로 await 없이 부르면 응답이 끝날 때까지
+# 이벤트 루프 전체가 멈춘다(다른 유저 명령·디스코드 하트비트 포함).
+# 아래 헬퍼로 항상 스레드에 넘겨서 실행한다.
+# =============================================================================
+_AI_STREAM_DONE = object()
+
+
+async def ai_generate(model, prompt: str):
+    """동기 generate_content를 스레드에서 실행."""
+    return await asyncio.to_thread(model.generate_content, prompt)
+
+
+async def ai_send(chat_session, message: str):
+    """동기 send_message(비스트리밍)를 스레드에서 실행."""
+    return await asyncio.to_thread(chat_session.send_message, message)
+
+
+async def ai_stream(chat_session, message: str):
+    """동기 스트리밍 제너레이터를 스레드에서 돌리고 청크를 async로 넘긴다."""
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _worker():
+        try:
+            for chunk in chat_session.send_message(message, stream=True):
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+        except Exception as exc:  # 예외도 큐로 넘겨 호출부에서 다시 던진다
+            loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(chunk_queue.put_nowait, _AI_STREAM_DONE)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    while True:
+        item = await chunk_queue.get()
+        if item is _AI_STREAM_DONE:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+# =============================================================================
+# 공용 HTTP 세션
+# 명령어마다 ClientSession을 새로 만들면 커넥션 풀과 TLS 핸드셰이크를 매번
+# 다시 하게 된다. 하나를 만들어 재사용한다.
+# =============================================================================
+_http_session = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            connector=aiohttp.TCPConnector(limit=50, ttl_dns_cache=300),
+        )
+    return _http_session
+
+
+@contextlib.asynccontextmanager
+async def http_session():
+    """`async with` 형태를 유지하되 공용 세션을 빌려주고 닫지 않는다."""
+    yield await get_http_session()
+
+
+# =============================================================================
+# 채널 히스토리 병렬 스캔
+# 채널을 하나씩 순회하면 채널 수 x 페이지 수만큼 왕복이 직렬로 쌓인다.
+# 동시 실행 수만 제한해서 병렬로 훑는다.
+# =============================================================================
+CHANNEL_SCAN_CONCURRENCY = 5
+
+
+async def scan_channels(guild, me, scan_one):
+    """읽기 권한이 있는 텍스트 채널을 병렬로 훑고 scan_one의 결과 목록을 반환."""
+    semaphore = asyncio.Semaphore(CHANNEL_SCAN_CONCURRENCY)
+
+    async def _guarded(channel):
+        try:
+            if not channel.permissions_for(me).read_message_history:
+                return None
+            async with semaphore:
+                return await scan_one(channel)
+        except Exception as scan_error:
+            print(f"채널 스캔 실패 ({channel.name}): {scan_error}")
+            return None
+
+    results = await asyncio.gather(*[_guarded(ch) for ch in guild.text_channels])
+    return [result for result in results if result is not None]
+
 
 # 페르소나 AI 채팅 설정
 DEFAULT_PERSONA = """
@@ -242,11 +369,28 @@ bot_memory = {
     'conversation_summaries': {}  # 채널별 대화 요약
 }
 
-def save_memory():
-    """메모리를 파일에 저장"""
+MEMORY_SAVE_MIN_INTERVAL = 10  # 초
+_memory_last_save = 0.0
+_memory_dirty = False
+
+
+def save_memory(force: bool = False):
+    """메모리를 파일에 저장.
+
+    기억 하나 추가될 때마다 JSON 전체를 다시 쓰던 걸, 최소 간격을 두고 묶어서
+    쓰도록 바꿨다. force=True면 간격을 무시하고 즉시 쓴다.
+    """
+    global _memory_last_save, _memory_dirty
+
+    _memory_dirty = True
+    if not force and time.time() - _memory_last_save < MEMORY_SAVE_MIN_INTERVAL:
+        return
+
     try:
         with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(bot_memory, f, ensure_ascii=False, indent=2)
+        _memory_last_save = time.time()
+        _memory_dirty = False
         print("💾 메모리 저장 완료")
     except Exception as e:
         print(f"❌ 메모리 저장 실패: {e}")
@@ -373,7 +517,7 @@ async def summarize_and_save_conversation(user_id: int, user_name: str):
 - 짜장면보다 짬뽕을 좋아함
 """
         
-        response = gemini_model.generate_content(summary_prompt)
+        response = await ai_generate(gemini_model, summary_prompt)
         summary = response.text.strip()
         
         # "없음"이 아니면 저장
@@ -469,7 +613,7 @@ async def steam_game_watch_loop():
             if channel is None:
                 channel = await bot.fetch_channel(STEAM_ALERT_CHANNEL_ID)
 
-            async with aiohttp.ClientSession() as session:
+            async with http_session() as session:
                 players = await _fetch_steam_player_summaries(session)
 
             latest_state = {}
@@ -522,6 +666,89 @@ WOWS_API_BASE_URL = WOWS_API_REGIONS['na']  # 기본값: NA 서버
 
 _WOWS_REGION_NAMES = {'na': 'NA (북미)', 'eu': 'EU (유럽)', 'asia': 'ASIA (아시아)', 'ru': 'RU (러시아)'}
 
+# -----------------------------------------------------------------------------
+# 함선 백과사전 캐시
+# 함선 목록은 패치 때나 바뀌는 정적 데이터인데, 예전엔 명령어마다(그리고
+# .워쉽함선정보는 호출마다 10페이지씩) 다시 받아왔다. 리전별로 한 번만 받아
+# 캐시하고, 페이지는 병렬로 수집한다.
+# -----------------------------------------------------------------------------
+WOWS_SHIP_CACHE_TTL = 24 * 60 * 60  # 24시간
+
+_wows_ship_cache = {}        # {region: {ship_id(int): {'name','tier','type','nation'}}}
+_wows_ship_cache_time = {}   # {region: epoch}
+_wows_ship_cache_locks = {}  # {region: asyncio.Lock}
+
+
+def _wows_ship_cache_fresh(region_key: str) -> bool:
+    return (
+        region_key in _wows_ship_cache
+        and time.time() - _wows_ship_cache_time.get(region_key, 0) < WOWS_SHIP_CACHE_TTL
+    )
+
+
+async def get_wows_ships(session, api_base_url: str, region_key: str = 'na') -> dict:
+    """전체 함선 정보를 {ship_id: {name, tier, type, nation}} 형태로 반환 (캐시)."""
+    if _wows_ship_cache_fresh(region_key):
+        return _wows_ship_cache[region_key]
+
+    lock = _wows_ship_cache_locks.setdefault(region_key, asyncio.Lock())
+    async with lock:
+        # 락을 기다리는 동안 다른 태스크가 이미 채웠을 수 있다
+        if _wows_ship_cache_fresh(region_key):
+            return _wows_ship_cache[region_key]
+
+        url = f"{api_base_url}/wows/encyclopedia/ships/"
+        base_params = {
+            'application_id': WARGAMING_API_KEY,
+            'fields': 'name,tier,type,nation',
+            'limit': 100,
+        }
+
+        async def _fetch_page(page_no: int):
+            try:
+                params = dict(base_params, page_no=page_no)
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    payload = await resp.json()
+                    if payload.get('status') != 'ok':
+                        return None
+                    return payload
+            except Exception as page_error:
+                print(f"함선 백과사전 {page_no}페이지 수집 실패: {page_error}")
+                return None
+
+        first = await _fetch_page(1)
+        if not first:
+            return _wows_ship_cache.get(region_key, {})
+
+        ships = {}
+
+        def _absorb(payload):
+            for ship_id, info in (payload.get('data') or {}).items():
+                if info:
+                    ships[int(ship_id)] = info
+
+        _absorb(first)
+
+        page_total = (first.get('meta') or {}).get('page_total') or 1
+        if page_total > 1:
+            pages = await asyncio.gather(
+                *[_fetch_page(page_no) for page_no in range(2, page_total + 1)]
+            )
+            for payload in pages:
+                if payload:
+                    _absorb(payload)
+
+        if ships:
+            _wows_ship_cache[region_key] = ships
+            _wows_ship_cache_time[region_key] = time.time()
+            print(f"🚢 함선 백과사전 캐시 갱신: {region_key} {len(ships)}척")
+        return ships
+
+
 def _wows_parse_args(region_arg: str, player_name_arg):
     """리전/플레이어명 인자를 파싱해서 (region_lower, api_base_url, region_display, player_name) 반환.
     첫 번째 인자가 리전이 아니면 player_name으로 간주하고 region은 'na'로 설정."""
@@ -559,7 +786,17 @@ intents.message_content = True  # 권한 활성화
 intents.guilds = True
 intents.messages = True
 intents.members = True  # 멤버 목록 보기 권한 활성화
-bot = commands.Bot(command_prefix='.', intents=intents)
+class MoonBot(commands.Bot):
+    async def close(self):
+        global _http_session
+        if _memory_dirty:
+            save_memory(force=True)
+        if _http_session is not None and not _http_session.closed:
+            await _http_session.close()
+        await super().close()
+
+
+bot = MoonBot(command_prefix='.', intents=intents)
 
 # 봇 초기화 완료
 print("🤖 Moon Bot 초기화 완료")
@@ -1103,8 +1340,7 @@ async def _stream_ai_reply(reply_target, chat_session, prompt: str, max_len: int
     update_interval = 0.5
     last_update_time = time.time()
     try:
-        response = chat_session.send_message(prompt, stream=True)
-        for chunk in response:
+        async for chunk in ai_stream(chat_session, prompt):
             if chunk.text:
                 ai_response += chunk.text
                 cur = time.time()
@@ -1123,7 +1359,7 @@ async def _stream_ai_reply(reply_target, chat_session, prompt: str, max_len: int
     except Exception as stream_err:
         # 스트리밍 실패 시 일반 응답으로 폴백
         try:
-            response = chat_session.send_message(prompt)
+            response = await ai_send(chat_session, prompt)
             ai_response = response.text.strip()
             if len(ai_response) > max_len:
                 ai_response = ai_response[:max_len] + "..."
@@ -1264,9 +1500,7 @@ async def on_message(message):
                 last_update_time = time.time()
                 
                 try:
-                    response = persona_model.start_chat(history=[]).send_message(prompt, stream=True)
-                    
-                    for chunk in response:
+                    async for chunk in ai_stream(persona_model.start_chat(history=[]), prompt):
                         if chunk.text:
                             ai_response += chunk.text
                             
@@ -1457,18 +1691,20 @@ async def on_message(message):
 async def chatgpt_command(ctx, *, message):
     """ChatGPT와 대화하는 명령어"""
     try:
-        from openai import OpenAI
+        client = get_openai_client()
+        if client is None:
+            await ctx.send("❌ OpenAI API 키가 설정되지 않았습니다!")
+            return
         
-        # OpenAI 클라이언트 생성
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        
-        # ChatGPT API 호출
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": message}
-            ],
-            max_tokens=1000
+        # 동기 SDK라서 스레드에서 호출한다 (이벤트 루프 블로킹 방지)
+        response = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "user", "content": message}
+                ],
+                max_tokens=1000
+            )
         )
         
         # 응답 추출
@@ -1490,51 +1726,40 @@ async def message_search(ctx, *, search_query):
         # 검색 결과 저장
         search_results = []
         
-        # 서버의 모든 텍스트 채널에서 메시지 수집
-        for channel in ctx.guild.text_channels:
-            try:
-                if not channel.permissions_for(ctx.guild.me).read_message_history:
+        # 모든 텍스트 채널을 병렬로 훑는다.
+        # 키워드 히트와 AI 분석용 메시지 풀을 한 번에 모아서, 결과가 부족할 때
+        # 전 채널을 다시 스캔하지 않도록 한다.
+        async def _scan_for_query(channel):
+            hits = []
+            pool = []
+            async for message in channel.history(limit=2000):
+                if not message.content or message.content.startswith('.'):
                     continue
-                    
-                async for message in channel.history(limit=2000):
-                    if message.content and not message.content.startswith('.'):
-                        # 키워드 검색 (정확한 단어 매칭)
-                        if search_query.lower() in message.content.lower():
-                            search_results.append({
-                                'message': message,
-                                'channel': channel,
-                                'type': 'keyword'
-                            })
-                        # 결과가 너무 많으면 중단
-                        if len(search_results) >= 20:
-                            break
-                            
-                if len(search_results) >= 20:
+                if search_query.lower() in message.content.lower():
+                    if len(hits) < 20:
+                        hits.append({
+                            'message': message,
+                            'channel': channel,
+                            'type': 'keyword'
+                        })
+                elif len(pool) < 100:
+                    pool.append(message)
+                if len(hits) >= 20 and len(pool) >= 100:
                     break
-            except:
-                continue
+            return hits, pool
+
+        message_pool = []
+        for hits, pool in await scan_channels(ctx.guild, ctx.guild.me, _scan_for_query):
+            search_results.extend(hits)
+            message_pool.extend(pool)
+        search_results = search_results[:20]
         
         # 키워드 검색 결과가 적으면 상황 검색 시도
         if len(search_results) < 5:
             await loading_msg.edit(content=f"🔍 키워드 검색 결과 부족. AI 상황 분석으로 확장 검색 중...")
             
-            # 추가 메시지 수집 (상황 분석용)
-            additional_messages = []
-            for channel in ctx.guild.text_channels:
-                try:
-                    if not channel.permissions_for(ctx.guild.me).read_message_history:
-                        continue
-                        
-                    async for message in channel.history(limit=1000):
-                        if message.content and not message.content.startswith('.'):
-                            additional_messages.append(message)
-                            if len(additional_messages) >= 100:
-                                break
-                                
-                    if len(additional_messages) >= 100:
-                        break
-                except:
-                    continue
+            # 1차 스캔에서 이미 모아둔 메시지를 재사용한다
+            additional_messages = message_pool[:100]
             
             # AI로 상황 분석
             if additional_messages:
@@ -1558,7 +1783,7 @@ async def message_search(ctx, *, search_query):
 """
                 
                 try:
-                    response = gemini_model.generate_content(prompt)
+                    response = await ai_generate(gemini_model, prompt)
                     ai_result = response.text.strip()
                     
                     numbers = re.findall(r'\d+', ai_result)
@@ -1699,7 +1924,7 @@ async def ai_trial(ctx, *, hint: str = None):
 """
         
         # Gemini API 호출
-        response = gemini_model.generate_content(prompt)
+        response = await ai_generate(gemini_model, prompt)
         verdict = response.text
         
         # 결과 전송 (너무 길면 분할)
@@ -1820,9 +2045,7 @@ async def ai_chat(ctx, *, question: str = None):
         last_update_time = time.time()
         
         try:
-            response = chat_sessions[channel_id].send_message(message_with_context, stream=True)
-            
-            for chunk in response:
+            async for chunk in ai_stream(chat_sessions[channel_id], message_with_context):
                 if chunk.text:
                     ai_response += chunk.text
                     
@@ -1847,7 +2070,7 @@ async def ai_chat(ctx, *, question: str = None):
         except Exception as stream_error:
             print(f"스트리밍 오류: {stream_error}")
             # 스트리밍 실패시 일반 응답으로 폴백
-            response = chat_sessions[channel_id].send_message(message_with_context)
+            response = await ai_send(chat_sessions[channel_id], message_with_context)
             ai_response = response.text.strip()
             if len(ai_response) > 1500:
                 ai_response = ai_response[:1500] + "..."
@@ -1890,7 +2113,7 @@ async def google_search(query: str, num_results: int = 5):
             'num': min(num_results, 10)
         }
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             async with session.get(url, params=params) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -2014,7 +2237,7 @@ async def search_chat(ctx, *, query: str = None):
         tool_call = None
         try:
             planner_model = gemini_model or persona_model
-            planner_response = planner_model.generate_content(planner_prompt)
+            planner_response = await ai_generate(planner_model, planner_prompt)
             planner_text = (planner_response.text or "").strip()
             tool_call = extract_tool_call_from_text(planner_text)
         except Exception as planner_error:
@@ -2085,7 +2308,7 @@ async def search_chat(ctx, *, query: str = None):
             if channel_id not in chat_sessions:
                 chat_sessions[channel_id] = persona_model.start_chat(history=[])
 
-            response = chat_sessions[channel_id].send_message(prompt)
+            response = await ai_send(chat_sessions[channel_id], prompt)
             ai_response = response.text.strip()
         
         if len(ai_response) > 1900:
@@ -2124,29 +2347,25 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
     try:
         loading_msg = await ctx.send(f"🔍 **{target_user.display_name}**의 채팅 스타일 분석 중... (메시지 수집 중)")
         
-        # 해당 유저의 메시지 수집
-        messages = []
-        message_count = 0
-        
-        # 서버의 모든 텍스트 채널에서 메시지 수집
-        for channel in ctx.guild.text_channels:
-            try:
-                if not channel.permissions_for(ctx.guild.me).read_message_history:
+        # 해당 유저의 메시지 수집 (모든 텍스트 채널을 병렬로 훑는다)
+        async def _collect_user_messages(channel):
+            found = []
+            async for message in channel.history(limit=500):
+                if message.author.id != target_user.id:
                     continue
-                    
-                async for message in channel.history(limit=500):
-                    if message.author.id == target_user.id and message.content and not message.content.startswith('.'):
-                        # 너무 짧거나 링크만 있는 메시지 제외
-                        if len(message.content) > 3 and not message.content.startswith('http'):
-                            messages.append(message.content)
-                            message_count += 1
-                            if message_count >= 150:
-                                break
-                            
-                if message_count >= 150:
-                    break
-            except:
-                continue
+                if not message.content or message.content.startswith('.'):
+                    continue
+                # 너무 짧거나 링크만 있는 메시지 제외
+                if len(message.content) > 3 and not message.content.startswith('http'):
+                    found.append(message.content)
+                    if len(found) >= 150:
+                        break
+            return found
+
+        messages = []
+        for found in await scan_channels(ctx.guild, ctx.guild.me, _collect_user_messages):
+            messages.extend(found)
+        messages = messages[:150]
         
         if len(messages) < 15:
             await loading_msg.edit(content=f"❌ **{target_user.display_name}**의 메시지가 부족해요. (최소 15개 필요, 현재 {len(messages)}개)")
@@ -2175,7 +2394,7 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
 구체적인 예시를 포함해서 분석해줘.
 """
         
-        response = gemini_model.generate_content(analysis_prompt)
+        response = await ai_generate(gemini_model, analysis_prompt)
         style_analysis = response.text
         
         # 페르소나 인스트럭션 생성
@@ -2197,7 +2416,7 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
 system instruction만 출력해 (다른 설명 없이):
 """
         
-        persona_response = gemini_model.generate_content(persona_prompt)
+        persona_response = await ai_generate(gemini_model, persona_prompt)
         generated_persona = persona_response.text.strip()
         
         # 학습 데이터 저장 (문자열 키로 저장 - JSON 호환)
@@ -2214,7 +2433,7 @@ system instruction만 출력해 (다른 설명 없이):
         # 장기기억에 저장
         bot_memory['learned_users'] = learned_user_styles
         bot_memory['active_persona'] = user_id_str
-        save_memory()
+        save_memory(force=True)
         
         # 바로 이 페르소나를 활성화
         current_persona = generated_persona
@@ -2290,7 +2509,7 @@ async def apply_learned_persona(ctx, target_user: discord.Member = None):
         
         # 메모리에도 저장
         bot_memory['active_persona'] = user_id_str
-        save_memory()
+        save_memory(force=True)
         
         await ctx.send(f"✅ **{data['name']}** 페르소나가 적용되었어요!\n이제 봇이 {data['name']}처럼 대답해요.")
         
@@ -2323,7 +2542,7 @@ async def delete_learned_user(ctx, target_user: discord.Member = None):
         del bot_memory['learned_users'][user_id_str]
     if bot_memory['active_persona'] == user_id_str:
         bot_memory['active_persona'] = None
-    save_memory()
+    save_memory(force=True)
     
     await ctx.send(f"✅ **{name}**의 학습 데이터가 삭제되었어요.")
 
@@ -2341,24 +2560,24 @@ async def analyze_style_only(ctx, target_user: discord.Member = None):
     try:
         loading_msg = await ctx.send(f"🔍 **{target_user.display_name}**의 말투 분석 중...")
         
-        # 메시지 수집
-        messages = []
-        for channel in ctx.guild.text_channels:
-            try:
-                if not channel.permissions_for(ctx.guild.me).read_message_history:
+        # 메시지 수집 (모든 텍스트 채널을 병렬로 훑는다)
+        async def _collect_user_messages(channel):
+            found = []
+            async for message in channel.history(limit=300):
+                if message.author.id != target_user.id:
                     continue
-                
-                async for message in channel.history(limit=300):
-                    if message.author.id == target_user.id and message.content and not message.content.startswith('.'):
-                        if len(message.content) > 3:
-                            messages.append(message.content)
-                            if len(messages) >= 50:
-                                break
-                
-                if len(messages) >= 50:
-                    break
-            except:
-                continue
+                if not message.content or message.content.startswith('.'):
+                    continue
+                if len(message.content) > 3:
+                    found.append(message.content)
+                    if len(found) >= 50:
+                        break
+            return found
+
+        messages = []
+        for found in await scan_channels(ctx.guild, ctx.guild.me, _collect_user_messages):
+            messages.extend(found)
+        messages = messages[:50]
         
         if len(messages) < 10:
             await loading_msg.edit(content=f"❌ 메시지가 부족해요. (최소 10개 필요, 현재 {len(messages)}개)")
@@ -2391,7 +2610,7 @@ async def analyze_style_only(ctx, target_user: discord.Member = None):
 재미있게 분석해줘!
 """
         
-        response = gemini_model.generate_content(prompt)
+        response = await ai_generate(gemini_model, prompt)
         
         await loading_msg.edit(content=response.text[:1900])
         
@@ -2744,7 +2963,7 @@ async def wows_stats(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!\n.env 파일에 WARGAMING_API_KEY를 추가해주세요.\nhttps://developers.wargaming.net/ 에서 발급받을 수 있습니다.")
             return
 
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             # 1단계: 플레이어 검색
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
@@ -2992,7 +3211,7 @@ async def wows_actor_stats(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
 
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -3060,7 +3279,7 @@ async def wows_ship_stats(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
 
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             # 1단계: 플레이어 검색
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
@@ -3110,58 +3329,30 @@ async def wows_ship_stats(ctx, region: str = 'na', *, player_name: str = None):
                 print(f"함선 데이터 로드 오류: {e}")
                 return
             
-            # 3단계: 함선 정보 가져오기 (함선 이름) - 재시도 로직 포함
+            # 3단계: 함선 정보 가져오기 (함선 이름)
             ship_names = {}
             ship_details = {}
             
             await loading_msg.edit(content=f"🔍 '{found_nickname}'의 함선 이름 로딩 중...")
             
-            # 전투 수 기준으로 정렬 (encyclopedia 요청 전에 미리 정렬)
+            # 전투 수 기준으로 정렬 (상위 10개만 이름이 필요하다)
             player_ships.sort(key=lambda x: x.get('pvp', {}).get('battles', 0), reverse=True)
             
-            # 상위 10개 함선의 ID만 가져오기
-            top_ship_ids = [str(ship['ship_id']) for ship in player_ships[:10]]
-            
-            if top_ship_ids:
-                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                encyclopedia_params = {
-                    'application_id': WARGAMING_API_KEY,
-                    'ship_id': ','.join(top_ship_ids),
-                    'fields': 'name,tier,type,nation'
-                }
-                
-                # 최대 3번 재시도
-                for retry in range(3):
-                    try:
-                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                            if response.status == 200:
-                                encyclopedia_data = await response.json()
-                                if encyclopedia_data.get('status') == 'ok' and encyclopedia_data.get('data'):
-                                    for ship_id, ship_info in encyclopedia_data['data'].items():
-                                        ship_id_int = int(ship_id)
-                                        ship_names[ship_id_int] = ship_info.get('name', f'함선 ID {ship_id}')
-                                        ship_details[ship_id_int] = {
-                                            'tier': ship_info.get('tier', 0),
-                                            'type': ship_info.get('type', 'Unknown'),
-                                            'nation': ship_info.get('nation', 'Unknown')
-                                        }
-                                    print(f"✅ {len(ship_names)}개 함선 이름 로드 완료")
-                                    break  # 성공하면 루프 탈출
-                            else:
-                                print(f"⚠️ Encyclopedia API 오류 (상태: {response.status}, 재시도: {retry+1}/3)")
-                                if retry < 2:
-                                    await asyncio.sleep(1)  # 1초 대기 후 재시도
-                    except asyncio.TimeoutError:
-                        print(f"⚠️ Encyclopedia API 타임아웃 (재시도: {retry+1}/3)")
-                        if retry < 2:
-                            await asyncio.sleep(1)  # 1초 대기 후 재시도
-                    except Exception as e:
-                        print(f"⚠️ Encyclopedia API 오류: {e} (재시도: {retry+1}/3)")
-                        if retry < 2:
-                            await asyncio.sleep(1)  # 1초 대기 후 재시도
-            
-            # 전투 수 기준으로 정렬
-            player_ships.sort(key=lambda x: x.get('pvp', {}).get('battles', 0), reverse=True)
+            if player_ships:
+                # 캐시된 백과사전에서 조회 (예전엔 명령어마다 다시 받아왔다)
+                all_ships = await get_wows_ships(session, api_base_url, region_lower)
+                for ship in player_ships[:10]:
+                    ship_id_int = int(ship['ship_id'])
+                    ship_info = all_ships.get(ship_id_int)
+                    if not ship_info:
+                        continue
+                    ship_names[ship_id_int] = ship_info.get('name', f'함선 ID {ship_id_int}')
+                    ship_details[ship_id_int] = {
+                        'tier': ship_info.get('tier', 0),
+                        'type': ship_info.get('type', 'Unknown'),
+                        'nation': ship_info.get('nation', 'Unknown')
+                    }
+                print(f"✅ {len(ship_names)}개 함선 이름 로드 완료")
             
             # 상위 10개 함선만 표시
             top_ships = player_ships[:10]
@@ -3284,7 +3475,7 @@ async def wows_clan(ctx, region: str = 'na', *, clan_tag: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             clan_url = f"{api_base_url}/wows/clans/list/"
             clan_params = {
                 'application_id': WARGAMING_API_KEY,
@@ -3395,103 +3586,42 @@ async def wows_ship_info(ctx, *, ship_name: str):
         
         loading_msg = await ctx.send(f"🔍 함선 '{ship_name}' 정보 검색 중...")
         
-        async with aiohttp.ClientSession() as session:
-            # 함선 검색 방법 1: 이름으로 검색 (최소 필드만)
-            ships_url = f"{WOWS_API_REGIONS['na']}/wows/encyclopedia/ships/"
-            search_params = {
-                'application_id': WARGAMING_API_KEY,
-                'fields': 'name'  # 먼저 이름만 가져와서 검색
-            }
-            
+        async with http_session() as session:
+            # 캐시된 백과사전에서 이름 검색 (예전엔 호출마다 10페이지를 순차로 받았다)
             found_ship_id = None
             try:
-                # 이름으로 검색 (정확한 매칭 우선, 부분 검색은 보조)
+                all_ships = await get_wows_ships(session, WOWS_API_REGIONS['na'], 'na')
+                if not all_ships:
+                    await loading_msg.edit(content="❌ 함선 목록을 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
+                    return
+
                 search_name_lower = ship_name.lower().strip()
-                
-                # 1단계: 정확한 이름 매칭
                 exact_matches = []
-                # 2단계: 부분 검색
                 partial_matches = []
-                
-                # 여러 페이지를 순회하며 검색 (최대 10페이지까지)
-                page_total = 10  # 최대 페이지 수
-                current_page = 1
-                
-                while current_page <= page_total:
-                    page_params = search_params.copy()
-                    page_params['page_no'] = current_page
-                    page_params['limit'] = 100  # 페이지당 항목 수
-                    
-                    async with session.get(ships_url, params=page_params, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                        if response.status != 200:
-                            if current_page == 1:
-                                error_text = await response.text()
-                                await loading_msg.edit(content=f"❌ API 요청 실패! (상태: {response.status})")
-                                print(f"함선 검색 API 오류: {error_text}")
-                                return
-                            break
-                        
-                        ships_data = await response.json()
-                        if ships_data.get('status') != 'ok':
-                            if current_page == 1:
-                                error_msg = ships_data.get('error', {}).get('message', '알 수 없는 오류')
-                                await loading_msg.edit(content=f"❌ API 오류: {error_msg}")
-                                print(f"API 오류 상세: {ships_data}")
-                                return
-                            break
-                        
-                        # 페이지 정보 업데이트
-                        meta = ships_data.get('meta', {})
-                        actual_page_total = meta.get('page_total', page_total)
-                        if current_page == 1:
-                            page_total = min(actual_page_total, 10)  # 최대 10페이지까지만
-                        
-                        # 함선 데이터 확인
-                        ship_data_dict = ships_data.get('data', {})
-                        if not ship_data_dict:
-                            # 더 이상 데이터가 없으면 종료
-                            break
-                        
-                        # 함선 검색
-                        for ship_id, ship_data in ship_data_dict.items():
-                            ship_name_full = ship_data.get('name', '')
-                            if not ship_name_full:
-                                continue
-                            
-                            ship_name_lower = ship_name_full.lower()
-                            
-                            # 함선 이름에 대괄호가 포함되어 있으면 완전히 제외
-                            if '[' in ship_name_full or ']' in ship_name_full:
-                                continue
-                            
-                            # 정확한 매칭
-                            if search_name_lower == ship_name_lower:
-                                exact_matches.append((ship_id, ship_name_full))
-                                found_ship_id = ship_id  # 정확한 매칭을 찾으면 즉시 종료
-                                print(f"✅ 정확한 매칭 발견: {ship_name_full} (페이지 {current_page})")
-                                break
-                            # 부분 검색
-                            elif search_name_lower in ship_name_lower:
-                                partial_matches.append((ship_id, ship_name_full))
-                        
-                        # 디버깅: 첫 페이지에서 검색된 함선 수 확인
-                        if current_page == 1:
-                            print(f"검색어: '{ship_name}', 페이지 {current_page}에서 {len(ship_data_dict)}개 함선 검색, 정확한 매칭: {len(exact_matches)}, 부분 매칭: {len(partial_matches)}")
-                        
-                        # 정확한 매칭을 찾으면 검색 종료
-                        if found_ship_id:
-                            break
-                        
-                        current_page += 1
-                
-                # 정확한 매칭이 있으면 사용
+
+                for cached_ship_id, ship_data in all_ships.items():
+                    ship_name_full = ship_data.get('name', '')
+                    # 이름에 대괄호가 있는 항목(테스트/특수 함선)은 제외
+                    if not ship_name_full or '[' in ship_name_full or ']' in ship_name_full:
+                        continue
+
+                    ship_name_lower = ship_name_full.lower()
+                    if search_name_lower == ship_name_lower:
+                        exact_matches.append((str(cached_ship_id), ship_name_full))
+                    elif search_name_lower in ship_name_lower:
+                        partial_matches.append((str(cached_ship_id), ship_name_full))
+
+                print(
+                    f"검색어: '{ship_name}', 함선 {len(all_ships)}척 중 "
+                    f"정확한 매칭: {len(exact_matches)}, 부분 매칭: {len(partial_matches)}"
+                )
+
                 if exact_matches:
                     found_ship_id = exact_matches[0][0]
-                # 없으면 부분 검색 결과 사용 (대괄호 없는 함선만)
                 elif partial_matches:
+                    # 이름이 짧을수록 검색어에 가까운 함선일 확률이 높다
+                    partial_matches.sort(key=lambda item: len(item[1]))
                     found_ship_id = partial_matches[0][0]
-                else:
-                    found_ship_id = None
             except asyncio.TimeoutError:
                 await loading_msg.edit(content="❌ 함선 검색 시간 초과! API 응답이 너무 느립니다.")
                 return
@@ -3719,22 +3849,20 @@ async def wows_compare(ctx, region: str = 'na', *, players: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
 
-        async with aiohttp.ClientSession() as session:
-            players_data = []
-            for player_name in [player1_name, player2_name]:
+        async with http_session() as session:
+            async def _collect_player(player_name):
+                """플레이어 한 명의 전적+PR을 모은다. (데이터, 오류메시지) 반환."""
                 result = await _wows_find_player(session, api_base_url, player_name)
                 if not result:
-                    await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
-                    return
+                    return None, f"❌ '{player_name}' 플레이어를 찾을 수 없습니다."
                 account_id, nickname = result
 
                 stats_url = f"{api_base_url}/wows/account/info/"
                 stats_params = {'application_id': WARGAMING_API_KEY, 'account_id': account_id}
                 async with session.get(stats_url, params=stats_params) as stats_response:
                     stats_data = await stats_response.json()
-                    if stats_data.get('status') != 'ok' or not stats_data.get('data'):
-                        await loading_msg.edit(content=f"❌ '{nickname}' 전적 정보를 가져올 수 없습니다.")
-                        return
+                if stats_data.get('status') != 'ok' or not stats_data.get('data'):
+                    return None, f"❌ '{nickname}' 전적 정보를 가져올 수 없습니다."
 
                 player_data = stats_data['data'][str(account_id)]
                 stats = player_data.get('statistics', {}).get('pvp', {})
@@ -3783,14 +3911,28 @@ async def wows_compare(ctx, region: str = 'na', *, players: str = None):
                         print(f"비교 PR 계산 오류 ({nickname}): {e}")
                         pr = 0
 
-                players_data.append({
+                return {
                     'name': nickname,
                     'battles': battles,
                     'win_rate': win_rate,
                     'avg_damage': avg_damage,
                     'avg_frags': avg_frags,
                     'pr': pr
-                })
+                }, None
+
+            # 두 플레이어는 서로 독립적이므로 동시에 조회한다
+            collected = await asyncio.gather(
+                _collect_player(player1_name),
+                _collect_player(player2_name),
+            )
+
+            players_data = []
+            for entry, error_message in collected:
+                if error_message:
+                    await loading_msg.edit(content=error_message)
+                    return
+                players_data.append(entry)
+
 
             if len(players_data) != 2:
                 await loading_msg.edit(content="❌ 두 플레이어 정보를 모두 가져올 수 없습니다.")
@@ -3864,7 +4006,7 @@ async def wows_ranked(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -3942,7 +4084,7 @@ async def wows_achievements(ctx, region: str = 'na', *, player_name: str = None)
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -4034,20 +4176,11 @@ async def wows_recent_battles(ctx, region: str = 'na', *, player_name: str = Non
 
 @bot.command(name='워쉽랭킹')
 async def wows_ship_ranking(ctx, *, ship_name: str):
-    """함선 순위표를 조회하는 명령어"""
-    try:
-        loading_msg = await ctx.send(f"🔍 함선 '{ship_name}' 순위표 검색 중...")
-        
-        if not _wows_api_key_ok():
-            await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
-            return
-        
-        # 주의: Wargaming API는 함선별 랭킹을 직접 제공하지 않습니다
-        await loading_msg.edit(content="⚠️ Wargaming API는 함선별 랭킹을 직접 제공하지 않습니다.\n대신 해당 함선의 정보를 확인하려면 `.워쉽함선정보 [함선명]` 명령어를 사용하세요.")
-        
-    except Exception as e:
-        await ctx.send(f"❌ 랭킹 검색 중 오류: {str(e)}")
-        print(f"워쉽 랭킹 오류: {e}")
+    """Wargaming API가 함선별 랭킹을 제공하지 않아 .워쉽함선정보로 안내한다."""
+    await ctx.send(
+        "⚠️ Wargaming API는 함선별 랭킹을 제공하지 않습니다.\n"
+        f"대신 `.워쉽함선정보 {ship_name}` 로 함선 정보를 확인하세요."
+    )
 
 @bot.command(name='워쉽티어')
 async def wows_tier_stats(ctx, region: str = 'na', *, player_name: str = None):
@@ -4073,7 +4206,7 @@ async def wows_tier_stats(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -4094,31 +4227,12 @@ async def wows_tier_stats(ctx, region: str = 'na', *, player_name: str = None):
                 
                 # 티어별 집계
                 tier_stats = {}
-                # 모든 함선의 ID 수집
-                ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                
-                # Encyclopedia에서 티어 정보 가져오기 (100개씩 분할 요청)
-                ship_tiers = {}
-                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                
-                # API 제한으로 인해 100개씩 분할
-                for i in range(0, len(ship_ids), 100):
-                    batch_ids = ship_ids[i:i+100]
-                    encyclopedia_params = {
-                        'application_id': WARGAMING_API_KEY,
-                        'ship_id': ','.join(batch_ids),
-                        'fields': 'tier'
-                    }
-                    
-                    try:
-                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                            if enc_response.status == 200:
-                                enc_data = await enc_response.json()
-                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                    for sid, ship_info in enc_data['data'].items():
-                                        ship_tiers[int(sid)] = ship_info.get('tier', 0)
-                    except:
-                        pass
+                # 티어 정보는 캐시된 백과사전에서 조회
+                all_ships = await get_wows_ships(session, api_base_url, region_lower)
+                ship_tiers = {
+                    ship_id: info.get('tier', 0)
+                    for ship_id, info in all_ships.items()
+                }
                 
                 for ship in player_ships:
                     pvp = ship.get('pvp', {})
@@ -4183,7 +4297,7 @@ async def wows_nation_stats(ctx, region: str = 'na', *, player_name: str = None)
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -4204,31 +4318,12 @@ async def wows_nation_stats(ctx, region: str = 'na', *, player_name: str = None)
                 
                 # 국가별 집계
                 nation_stats = {}
-                # 모든 함선의 ID 수집
-                ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                
-                # 함선 국가 정보 가져오기 (100개씩 분할 요청)
-                ship_nations = {}
-                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                
-                # API 제한으로 인해 100개씩 분할
-                for i in range(0, len(ship_ids), 100):
-                    batch_ids = ship_ids[i:i+100]
-                    encyclopedia_params = {
-                        'application_id': WARGAMING_API_KEY,
-                        'ship_id': ','.join(batch_ids),
-                        'fields': 'nation'
-                    }
-                    
-                    try:
-                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                            if enc_response.status == 200:
-                                enc_data = await enc_response.json()
-                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                    for sid, ship_info in enc_data['data'].items():
-                                        ship_nations[int(sid)] = ship_info.get('nation', 'Unknown')
-                    except:
-                        pass
+                # 국가 정보는 캐시된 백과사전에서 조회
+                all_ships = await get_wows_ships(session, api_base_url, region_lower)
+                ship_nations = {
+                    ship_id: info.get('nation', 'Unknown')
+                    for ship_id, info in all_ships.items()
+                }
                 
                 for ship in player_ships:
                     pvp = ship.get('pvp', {})
@@ -4292,7 +4387,7 @@ async def wows_type_stats(ctx, region: str = 'na', *, player_name: str = None):
             await loading_msg.edit(content="❌ Wargaming API 키가 설정되지 않았습니다!")
             return
         
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             result = await _wows_find_player(session, api_base_url, player_name)
             if not result:
                 await loading_msg.edit(content=f"❌ '{player_name}' 플레이어를 찾을 수 없습니다.")
@@ -4313,31 +4408,12 @@ async def wows_type_stats(ctx, region: str = 'na', *, player_name: str = None):
                 
                 # 타입별 집계
                 type_stats = {}
-                # 모든 함선의 ID 수집
-                ship_ids = [str(ship['ship_id']) for ship in player_ships]
-                
-                # 함선 타입 정보 가져오기 (100개씩 분할 요청)
-                ship_types = {}
-                encyclopedia_url = f"{api_base_url}/wows/encyclopedia/ships/"
-                
-                # API 제한으로 인해 100개씩 분할
-                for i in range(0, len(ship_ids), 100):
-                    batch_ids = ship_ids[i:i+100]
-                    encyclopedia_params = {
-                        'application_id': WARGAMING_API_KEY,
-                        'ship_id': ','.join(batch_ids),
-                        'fields': 'type'
-                    }
-                    
-                    try:
-                        async with session.get(encyclopedia_url, params=encyclopedia_params, timeout=aiohttp.ClientTimeout(total=10)) as enc_response:
-                            if enc_response.status == 200:
-                                enc_data = await enc_response.json()
-                                if enc_data.get('status') == 'ok' and enc_data.get('data'):
-                                    for sid, ship_info in enc_data['data'].items():
-                                        ship_types[int(sid)] = ship_info.get('type', 'Unknown')
-                    except:
-                        pass
+                # 타입 정보는 캐시된 백과사전에서 조회
+                all_ships = await get_wows_ships(session, api_base_url, region_lower)
+                ship_types = {
+                    ship_id: info.get('type', 'Unknown')
+                    for ship_id, info in all_ships.items()
+                }
                 
                 for ship in player_ships:
                     pvp = ship.get('pvp', {})
@@ -4412,7 +4488,7 @@ async def steam_id_lookup(ctx, *, profile_input: str = None):
         return
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http_session() as session:
             resolve_url = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/"
             params = {"key": STEAM_API_KEY, "vanityurl": vanity}
             async with session.get(resolve_url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
