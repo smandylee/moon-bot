@@ -23,5 +23,5 @@ STEAM_POLL_INTERVAL_SECONDS=300
 # Railway 등 서버 배포: 아래 환경변수에 JSON 키 전체 내용을 넣으세요
 GCP_KEY_JSON={"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}
 # Gemini 모델 ID (페르소나, 서치챗 등 전 기능 공통)
-VERTEX_MODEL=gemini-3.7-flash
+VERTEX_MODEL=gemini-3.8-flash
 # GCP_LOCATION=global
