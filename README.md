@@ -14,17 +14,13 @@
 
 ### 🔮 Fortune & Entertainment
 - `.가챠운세` - Special fortune before gacha pulls
-- `.워쉽가챠 [count]` - Warships gacha simulation
-- `.림버스 [count]` - Limbus Company gacha simulation
 - `.점메추` - Lunch recommendations
 
 ### ⚓ World of Warships
 - `.워쉽전적 [플레이어명]` - Search player stats on WoWS US server
 
 ### 🎯 Advanced Features
-- `.인성진단 @유저명` - Personality analysis of users
 - `.부검 [query]` - Search through message history
-- `.포켓몬위치 [name]` - Find Pokemon locations
 - `.대화모드` - AI conversation mode
 - `.멤버목록` - Display server member list
 
@@ -84,12 +80,8 @@ Use these commands in your Discord channel:
 - `.도움말` - Show help menu
 
 ### Entertainment Commands
-- `.워쉽가챠 [count]` - Simulate Warships gacha pulls
-- `.림버스 [count]` - Simulate Limbus Company gacha pulls
 - `.점메추` - Get lunch recommendations
-- `.인성진단 @유저명` - Analyze user's personality
 - `.부검 [query]` - Search message history
-- `.포켓몬위치 [name]` - Find Pokemon locations
 
 ### World of Warships Commands
 - `.워쉽전적 [player_name]` - Look up player statistics on WoWS US server
@@ -115,7 +107,6 @@ Use these commands in your Discord channel:
 ```
 moon_bot/
 ├── bot.py                 # Main bot file
-├── pokemon_data.py        # Pokemon data and functions
 ├── requirements.txt       # Python dependencies
 ├── env_example.txt       # Environment variables template
 ├── README.md             # This file
