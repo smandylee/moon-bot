@@ -366,7 +366,8 @@ bot_memory = {
     'active_persona': None,   # 현재 활성화된 페르소나 유저 ID
     'user_memories': {},      # 유저별 기억 {user_id: [{fact, timestamp}, ...]}
     'server_facts': [],       # 서버 관련 기억
-    'conversation_summaries': {}  # 채널별 대화 요약
+    'conversation_summaries': {},  # 채널별 대화 요약
+    'burger_count': 1         # 햄버거/배달 시킨 횟수 (이미 1회 먹어서 1부터 시작)
 }
 
 MEMORY_SAVE_MIN_INTERVAL = 10  # 초
@@ -535,6 +536,56 @@ async def summarize_and_save_conversation(user_id: int, user_name: str):
 load_memory()
 
 # ==================== 장기기억 시스템 끝 ====================
+
+# ==================== 햄버거 카운터 ====================
+# 특정 유저가 햄버거/배달을 시켰다고 말하면 횟수를 세고, 카운트당 12,500원으로 총액을 계산한다.
+BURGER_USER_ID = 320380927857655808
+BURGER_UNIT_PRICE = 12500
+
+# "햄버거/버거/배달" + "시켰다/시킴/주문했다" 같은 표현이 함께 나오면 1회로 센다
+_BURGER_FOOD_PATTERN = re.compile(r'햄버거|햄벅|버거|배달')
+_BURGER_ORDER_PATTERN = re.compile(r'시켰|시킴|시켜|시킨|시킬|주문|배달왔|배달 왔|도착')
+
+# 같은 주문을 연달아 말해도 중복으로 세지 않도록 하는 최소 간격(초)
+BURGER_COUNT_MIN_INTERVAL = 60
+_burger_last_count_time = 0.0
+
+
+def get_burger_count() -> int:
+    """저장된 햄버거 카운트를 반환."""
+    return int(bot_memory.get('burger_count', 0) or 0)
+
+
+def is_burger_order_message(content: str) -> bool:
+    """햄버거/배달을 시켰다는 말인지 판단."""
+    if not content:
+        return False
+    return bool(_BURGER_FOOD_PATTERN.search(content) and _BURGER_ORDER_PATTERN.search(content))
+
+
+def add_burger_count() -> int:
+    """햄버거 카운트를 1 올리고 새 카운트를 반환."""
+    count = get_burger_count() + 1
+    bot_memory['burger_count'] = count
+    save_memory()
+    return count
+
+
+def maybe_count_burger(user_id: int, content: str):
+    """대상 유저의 햄버거/배달 발언이면 카운트를 올리고 새 카운트를 반환. 아니면 None."""
+    global _burger_last_count_time
+
+    if user_id != BURGER_USER_ID or not is_burger_order_message(content):
+        return None
+
+    now = time.time()
+    if now - _burger_last_count_time < BURGER_COUNT_MIN_INTERVAL:
+        return None  # 같은 주문 얘기를 연달아 해도 한 번만 센다
+
+    _burger_last_count_time = now
+    return add_burger_count()
+
+# ==================== 햄버거 카운터 끝 ====================
 
 def get_speech_style_instruction(user_id: int) -> str:
     """유저별 존댓말 예외 규칙 비활성화"""
@@ -1574,6 +1625,14 @@ async def on_message(message):
     # "유기" 단어 감지 기능
     if "유기" in message.content:
         await message.channel.send("권문 또 유기야?")
+
+    # 햄버거/배달 시켰다는 말 감지 (대상 유저 한정)
+    burger_count = maybe_count_burger(message.author.id, message.content)
+    if burger_count is not None:
+        total = burger_count * BURGER_UNIT_PRICE
+        await message.channel.send(
+            f"🍔 햄버거 카운트 +1 → **{burger_count}회** (누적 {total:,}원)"
+        )
     
     # "상희" + "워쉽/배" 또는 "특정유저멘션" + "워쉽/배" 감지 시 스티커 출력
     sanghee_mentioned = "상희" in message.content or "<@406707656158478338>" in message.content or "<@!406707656158478338>" in message.content
@@ -1591,7 +1650,7 @@ async def on_message(message):
         await message.channel.send("이젖뀨 여미새련")
     # 박민제
     if "민제" in message.content:
-        await message.channel.send("박민제 시발 권문얼굴같은련")
+        await message.channel.send("나태의 신 박민제를 뵙습니다")
     # 뮤트 기능 - "@유저명 5분동안 닥쳐" 패턴 감지
     mute_pattern1 = r'<@!?(\d+)>\s*(\d+)분동안\s*닥쳐'
     mute_pattern2 = r'@(\S+)\s+(\d+)분동안\s*닥쳐'
@@ -4534,6 +4593,7 @@ async def help_command(ctx):
 
 `.랜덤` - 랜덤하게 싹바가지 없이 말한다 
 `.점메추` - 오늘 점심 뭐 먹을지 추천해줌
+`.햄버거` - 권문 햄버거/배달 시킨 횟수랑 총액 정산
 `.이미지 [URL] [제목]` - 이미지를 임베드로 보내기
 `.gpt [메시지]` - 핑프년아 니가 검색해(보류)
 `.부검 [검색어]` - 키워드 또는 상황으로 메시지 검색 (개유용함)
@@ -4625,6 +4685,33 @@ async def mute_status(ctx, user: discord.Member):
 
 
 
+
+
+@bot.command(name='햄버거')
+async def burger_count_command(ctx):
+    """햄버거 카운트와 총액을 보여주는 명령어"""
+    count = get_burger_count()
+    total = count * BURGER_UNIT_PRICE
+
+    target = ctx.guild.get_member(BURGER_USER_ID) if ctx.guild else None
+    target_name = target.display_name if target else f"<@{BURGER_USER_ID}>"
+
+    embed = discord.Embed(
+        title="🍔 햄버거 카운트",
+        description=f"**{target_name}**님이 지금까지 시킨 횟수",
+        color=0xE67E22
+    )
+    embed.add_field(
+        name="📊 집계",
+        value=f"```\n"
+              f"카운트: {count:,}회\n"
+              f"단가: {BURGER_UNIT_PRICE:,}원\n"
+              f"총액: {total:,}원\n"
+              f"```",
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
 
 
 @bot.command(name='가챠운세')
