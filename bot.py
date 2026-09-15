@@ -343,14 +343,34 @@ DEFAULT_PERSONA = """
 - 긴 설명이나 장문 금지
 """
 
-# 페르소나 모델 생성 (Vertex AI)
-persona_model = None
-if gemini_model is not None:
-    persona_model = GenerativeModel(
+# 어떤 페르소나를 쓰든 항상 붙는 출력 규칙.
+# 학습(.학습)으로 만든 지시문에는 길이 제한이 없어서, 그대로 쓰면 채팅이 아니라
+# 장문으로 쏟아진다. 기본 페르소나에만 있던 '짧게' 규칙을 공통으로 뺀 것.
+PERSONA_OUTPUT_RULES = """
+
+[출력 규칙 - 페르소나와 상관없이 항상 지킬 것]
+- 여긴 디스코드 채팅방이다. 1~3줄, 200자 안쪽으로 짧게 말해
+- 설명체나 보고서처럼 쓰지 마. 목록(-, 1.), 굵은 글씨, 제목 같은 서식도 쓰지 마
+- 여러 문단으로 길게 쏟아내지 마. 할 말이 많아도 핵심만 한마디로
+- 물어본 것에만 답해. 안 물어본 설명 덧붙이지 마
+- "저는 AI입니다" 같은 말 금지
+"""
+
+
+def build_persona_model(instruction: str = None):
+    """페르소나 모델 생성. 지시문에 공통 출력 규칙을 붙여서 만든다."""
+    if gemini_model is None:
+        return None
+
+    return GenerativeModel(
         VERTEX_MODEL,
-        system_instruction=[DEFAULT_PERSONA],
+        system_instruction=[(instruction or DEFAULT_PERSONA) + PERSONA_OUTPUT_RULES],
         client=genai_client,
     )
+
+
+# 페르소나 모델 생성 (Vertex AI)
+persona_model = build_persona_model(DEFAULT_PERSONA)
 
 # 채널별 대화 세션 관리
 chat_sessions = {}
@@ -418,11 +438,7 @@ def load_memory():
                 data = learned_user_styles[str(active_learned_persona)]
                 current_persona = data.get('persona_instruction', DEFAULT_PERSONA)
                 if gemini_model is not None:
-                    persona_model = GenerativeModel(
-                        VERTEX_MODEL,
-                        system_instruction=[current_persona],
-                        client=genai_client,
-                    )
+                    persona_model = build_persona_model(current_persona)
                     print(f"✅ 페르소나 복원: {data.get('name', 'Unknown')}")
                 else:
                     persona_model = None
@@ -2336,11 +2352,7 @@ async def change_persona(ctx, *, new_persona: str = None):
     try:
         # 새 페르소나로 모델 재생성
         current_persona = new_persona
-        persona_model = GenerativeModel(
-            VERTEX_MODEL,
-            system_instruction=[new_persona],
-            client=genai_client,
-        )
+        persona_model = build_persona_model(new_persona)
         
         # 모든 대화 세션 리셋
         chat_sessions.clear()
@@ -2362,11 +2374,7 @@ async def reset_persona(ctx):
             await ctx.send("❌ Vertex AI 인증이 없어 페르소나 리셋을 사용할 수 없어. `GCP_KEY_JSON`을 설정해줘.")
             return
         current_persona = DEFAULT_PERSONA
-        persona_model = GenerativeModel(
-            VERTEX_MODEL,
-            system_instruction=[DEFAULT_PERSONA],
-            client=genai_client,
-        )
+        persona_model = build_persona_model(DEFAULT_PERSONA)
         chat_sessions.clear()
         
         await ctx.send("✅ 페르소나가 기본값으로 리셋되었어!")
@@ -2792,8 +2800,10 @@ async def learn_user_style(ctx, target_user: discord.Member = None):
 - 말투, 자주 쓰는 표현, 성격을 구체적으로 명시
 - 절대 "AI입니다"라고 말하지 않도록 지시
 - 최대한 자연스럽게 그 사람처럼 행동하도록 지시
+- 디스코드 채팅이니까 1~3줄로 짧게 말하라고 반드시 명시
+- 설명체나 장문, 목록 서식을 쓰지 말라고 반드시 명시
 
-system instruction만 출력해 (다른 설명 없이):
+system instruction은 800자 안쪽으로, 그것만 출력해 (다른 설명 없이):
 """
         
         persona_response = await ai_generate(gemini_model, persona_prompt)
@@ -2817,11 +2827,7 @@ system instruction만 출력해 (다른 설명 없이):
         
         # 바로 이 페르소나를 활성화
         current_persona = generated_persona
-        persona_model = GenerativeModel(
-            VERTEX_MODEL,
-            system_instruction=[generated_persona],
-            client=genai_client,
-        )
+        persona_model = build_persona_model(generated_persona)
         chat_sessions.clear()
         active_learned_persona = user_id_str
         
@@ -2879,11 +2885,7 @@ async def apply_learned_persona(ctx, target_user: discord.Member = None):
         data = learned_user_styles[user_id_str]
         
         current_persona = data['persona_instruction']
-        persona_model = GenerativeModel(
-            VERTEX_MODEL,
-            system_instruction=[data['persona_instruction']],
-            client=genai_client,
-        )
+        persona_model = build_persona_model(data['persona_instruction'])
         chat_sessions.clear()
         active_learned_persona = user_id_str
         
