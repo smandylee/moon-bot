@@ -388,7 +388,7 @@ bot_memory = {
     'user_memories': {},      # 유저별 기억 {user_id: [{fact, timestamp}, ...]}
     'server_facts': [],       # 서버 관련 기억
     'conversation_summaries': {},  # 채널별 대화 요약
-    'burger_count': 1         # 햄버거/배달 시킨 횟수 (이미 1회 먹어서 1부터 시작)
+    'burger_count': 3         # 햄버거/배달 시킨 횟수
 }
 
 MEMORY_SAVE_MIN_INTERVAL = 10  # 초
