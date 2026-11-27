@@ -122,6 +122,12 @@ class Quote(commands.Cog):
             _quote_caption(target), file=quote_file, view=QuoteRemoveView(),
             allowed_mentions=discord.AllowedMentions.none())
 
+        # 채팅창이 지저분해지지 않게 '.명언' 메시지는 지운다 (메시지 관리 권한 필요)
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Quote(bot))
