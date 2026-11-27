@@ -33,3 +33,6 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db 
+# 런타임 데이터 / 로컬 전용
+bot_memory.json
+..bfg-report/

@@ -18,7 +18,7 @@ class ReloadHandler(FileSystemEventHandler):
         self.process = subprocess.Popen([sys.executable, self.script])
 
     def on_modified(self, event):
-        if event.src_path.endswith('bot.py'):
+        if event.src_path.endswith('.py'):
             print(f"{event.src_path} 변경 감지! 봇 재시작")
             self.start_bot()
 

@@ -94,9 +94,10 @@ Use these commands in your Discord channel:
 ## 🔧 Customization
 
 ### Basic Feature Customization
-- Modify the `random_messages` list in `bot.py` to add or change random messages
-- Update the `target_user_ids` list to change mentioned users
-- Customize game mention messages in the respective command functions
+- Random messages: `random_messages` in `cogs/fun.py`
+- Keyword reactions: `EXACT_REPLIES` / `CONTAINS_REPLIES` tables in `cogs/fun.py`
+- Mute length limit: `MUTE_MAX_MINUTES` in `cogs/moderation.py`
+- New feature: add a file under `cogs/` with an `async def setup(bot)` and list it in `EXTENSIONS` in `bot.py`
 
 ### API Integration
 - The bot supports both OpenAI GPT and Google Gemini AI (Vertex: `gemini-3.8-flash` by default via `VERTEX_MODEL`)
@@ -105,22 +106,33 @@ Use these commands in your Discord channel:
 ## 📁 Project Structure
 
 ```
-moon_bot/
-├── bot.py                 # Main bot file
-├── requirements.txt       # Python dependencies
-├── env_example.txt       # Environment variables template
-├── README.md             # This file
-└── render.yaml           # Deployment configuration
+moon-bot/
+├── bot.py              # Entry point: creates the bot and loads the cogs
+├── moonbot/            # Shared core
+│   ├── ai.py           #   Vertex AI (Gemini) / OpenAI clients, async helpers
+│   ├── memory.py       #   Long-term memory (bot_memory.json)
+│   ├── net.py          #   Shared aiohttp session, parallel channel scan
+│   └── discord_utils.py
+├── cogs/               # One file per feature area
+│   ├── ai_chat.py      #   Mention replies, .ai, .서치챗, persona/learning, chat mode
+│   ├── ai_tools.py     #   .gpt, .부검, .재판
+│   ├── fun.py          #   Random lines, game pings, 점메추, 가챠운세, burger counter, keyword reactions
+│   ├── quote.py        #   Quote images (right-click → Apps → 명언 만들기, or .명언)
+│   ├── moderation.py   #   "@user N분동안 닥쳐" timeouts, ❌ to delete bot messages
+│   ├── steam.py        #   Steam watch / price / ID lookup
+│   ├── wows.py         #   World of Warships stats
+│   ├── general.py      #   .도움말, .멤버목록, command error handling
+│   └── terminal.py     #   Local terminal → channel messaging
+├── quote_card.py       # Quote image renderer (Pillow)
+├── fonts/              # Noto Sans KR (SIL OFL) for quote images
+└── pr.json             # WoWS PR expected values
 ```
+
+Run `.도움말` in Discord for the full command list.
 
 ## 🛠️ Dependencies
 
-- `discord.py==2.3.2` - Discord API wrapper
-- `python-dotenv==1.0.0` - Environment variable management
-- `openai==1.3.7` - OpenAI API integration
-- `google-generativeai` - Google Gemini AI integration
-- `requests==2.31.0` - HTTP requests
-- `aiohttp==3.9.1` - Async HTTP client
+See `requirements.txt` (discord.py, google-genai, openai, aiohttp, Pillow, python-dotenv).
 
 ## 🚀 Deployment
 
